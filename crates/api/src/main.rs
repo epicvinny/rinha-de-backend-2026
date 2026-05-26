@@ -19,8 +19,9 @@ use tokio::net::{TcpListener, TcpStream};
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use api::search::Index;
-use api::{perf, scoring};
+mod perf;
+mod search;
+use search::Index;
 
 #[derive(Clone)]
 struct AppState {
@@ -55,12 +56,28 @@ async fn fraud_score(
 }
 
 fn response_for_bucket(bucket: u8) -> Result<Response, StatusCode> {
-    let response_body = scoring::body_for_bucket(bucket);
+    let response_body = response_body_for_bucket(bucket);
 
     Ok(Response::builder()
         .header(CONTENT_TYPE, "application/json")
         .body(axum::body::Body::from(response_body))
         .unwrap())
+}
+
+fn response_body_for_bucket(bucket: u8) -> &'static str {
+    match bucket {
+        0 => r#"{"approved":true,"fraud_score":0}"#,
+        1 => r#"{"approved":true,"fraud_score":0.2}"#,
+        2 => r#"{"approved":true,"fraud_score":0.4}"#,
+        3 => r#"{"approved":false,"fraud_score":0.6}"#,
+        4 => r#"{"approved":false,"fraud_score":0.8}"#,
+        5 => r#"{"approved":false,"fraud_score":1}"#,
+        _ => r#"{"approved":false,"fraud_score":1}"#,
+    }
+}
+
+fn score_bucket_for_fraud_score(fraud_score_val: f64) -> u8 {
+    (fraud_score_val * 5.0 + 0.1) as u8
 }
 
 fn score_body(
@@ -84,9 +101,9 @@ fn score_body(
         let search_total_us = perf::elapsed_us(search_start);
 
         let response_start = Instant::now();
-        let bucket = scoring::bucket_for_fraud_score(fraud_score_val);
+        let bucket = score_bucket_for_fraud_score(fraud_score_val);
         if build_response {
-            std::hint::black_box(scoring::body_for_bucket(bucket));
+            std::hint::black_box(response_body_for_bucket(bucket));
         }
         let response_build_us = perf::elapsed_us(response_start);
 
@@ -125,7 +142,7 @@ fn score_body(
         }
     }
 
-    Ok(scoring::bucket_for_fraud_score(fraud_score_val))
+    Ok(score_bucket_for_fraud_score(fraud_score_val))
 }
 
 async fn run_raw_server(listen: String, state: AppState) -> io::Result<()> {

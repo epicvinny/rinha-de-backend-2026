@@ -1,5 +1,0 @@
-services:
-  lb:
-    environment:
-      - UPSTREAM_POOL_PER_BACKEND=16
-      - UPSTREAM_PRECONNECT_PER_BACKEND=16
