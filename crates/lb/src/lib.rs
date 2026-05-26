@@ -323,10 +323,14 @@ async fn handle_client(
         )
         .await
         {
-            Ok(used_backend) => {
+            Ok((used_backend, static_response)) => {
                 request_trace.backend_idx = used_backend as u8;
                 let write_start = Instant::now();
-                client.write_all(&response_buf).await?;
+                if let Some(response) = static_response {
+                    client.write_all(response).await?;
+                } else {
+                    client.write_all(&response_buf).await?;
+                }
                 request_trace.client_write_us = elapsed_us(write_start);
                 "ok"
             }
@@ -366,7 +370,7 @@ async fn proxy_with_retries(
     body: &[u8],
     response_buf: &mut Vec<u8>,
     trace: &mut RequestTrace,
-) -> io::Result<usize> {
+) -> io::Result<(usize, Option<&'static [u8]>)> {
     let attempts = [selected, selected, selected ^ 1];
 
     for (attempt_idx, backend_idx) in attempts.into_iter().enumerate() {
@@ -396,10 +400,10 @@ async fn proxy_with_retries(
         .await;
 
         match result {
-            Ok(()) => {
+            Ok(static_response) => {
                 pool.put(stream).await;
                 drop(permit);
-                return Ok(backend_idx);
+                return Ok((backend_idx, static_response));
             }
             Err(_) => {
                 trace.reconnects += 1;
@@ -425,7 +429,7 @@ async fn forward_once(
     response_buf: &mut Vec<u8>,
     trace: &mut RequestTrace,
     protocol: UpstreamProtocol,
-) -> io::Result<()> {
+) -> io::Result<Option<&'static [u8]>> {
     match protocol {
         UpstreamProtocol::Http => {
             forward_once_http(
@@ -453,7 +457,7 @@ async fn forward_once_http(
     body: &[u8],
     response_buf: &mut Vec<u8>,
     trace: &mut RequestTrace,
-) -> io::Result<()> {
+) -> io::Result<Option<&'static [u8]>> {
     let mut request_buf = [0u8; STACK_UPSTREAM_FRAME_BYTES];
     if let Some(frame) = build_upstream_request(request.route, host, body, &mut request_buf)? {
         let write_start = Instant::now();
@@ -477,7 +481,7 @@ async fn forward_once_http(
     } else {
         trace.backend1 = 1;
     }
-    Ok(())
+    Ok(None)
 }
 
 async fn forward_once_raw(
@@ -485,9 +489,9 @@ async fn forward_once_raw(
     backend_idx: usize,
     request: &ParsedRequest,
     body: &[u8],
-    response_buf: &mut Vec<u8>,
+    _response_buf: &mut Vec<u8>,
     trace: &mut RequestTrace,
-) -> io::Result<()> {
+) -> io::Result<Option<&'static [u8]>> {
     if request.route != Route::FraudScore || body.len() > u16::MAX as usize {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -518,23 +522,23 @@ async fn forward_once_raw(
     upstream.read_exact(&mut code).await?;
     trace.upstream_wait_header_us += elapsed_us(response_start);
 
-    if code[0] == RAW_BAD_REQUEST {
-        response_buf.extend_from_slice(BAD_REQUEST);
+    let response = if code[0] == RAW_BAD_REQUEST {
+        BAD_REQUEST
     } else if let Some(response) = response_for_bucket(code[0]) {
-        response_buf.extend_from_slice(response);
+        response
     } else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "raw upstream returned invalid score bucket",
         ));
-    }
+    };
 
     if backend_idx == 0 {
         trace.backend0 = 1;
     } else {
         trace.backend1 = 1;
     }
-    Ok(())
+    Ok(Some(response))
 }
 
 fn response_for_bucket(bucket: u8) -> Option<&'static [u8]> {

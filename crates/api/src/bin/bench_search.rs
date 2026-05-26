@@ -1,9 +1,5 @@
-#[allow(dead_code)]
-#[path = "../search.rs"]
-mod search;
-
+use api::search::{Index, SearchEngine, SearchTraceSink};
 use memmap2::MmapOptions;
-use search::{Index, SearchEngine, SearchTraceSink};
 use serde::Deserialize;
 use serde_json::json;
 use std::fs::File;

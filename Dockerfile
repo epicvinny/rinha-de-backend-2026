@@ -17,7 +17,7 @@ COPY .cargo .cargo
 COPY crates crates
 
 ENV RUSTFLAGS="-C target-cpu=haswell -C target-feature=+avx2,+fma,+sse4.2"
-RUN cargo build --release -p builder -p api -p lb
+RUN cargo build --release -p builder -p api -p lb --bins
 
 # Stage 2: Build index
 FROM --platform=linux/amd64 debian:bookworm-slim AS index-builder
@@ -44,6 +44,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=rust-builder /build/target/release/api /opt/api
+COPY --from=rust-builder /build/target/release/edge /opt/edge
+COPY --from=rust-builder /build/target/release/placeholder /opt/placeholder
 COPY --from=rust-builder /build/target/release/lb /opt/lb
 COPY --from=index-builder /data/index.bin /opt/index.bin
 

@@ -1,0 +1,21 @@
+services:
+  lb:
+    deploy:
+      resources:
+        limits:
+          cpus: "0.90"
+          memory: "280MB"
+
+  api1:
+    deploy:
+      resources:
+        limits:
+          cpus: "0.05"
+          memory: "35MB"
+
+  api2:
+    deploy:
+      resources:
+        limits:
+          cpus: "0.05"
+          memory: "35MB"

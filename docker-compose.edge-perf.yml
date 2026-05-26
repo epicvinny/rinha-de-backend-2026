@@ -1,0 +1,7 @@
+services:
+  lb:
+    environment:
+      - PERF_TRACE=1
+      - PERF_TRACE_EVERY=${PERF_TRACE_EVERY:-10000}
+      - PERF_TRACE_SLOW_US=${PERF_TRACE_SLOW_US:-1000}
+      - PERF_TRACE_SAMPLE=${PERF_TRACE_SAMPLE:-0}
