@@ -69,7 +69,7 @@ pub async fn run(config: LbConfig) -> io::Result<()> {
 
     loop {
         let (stream, _) = listener.accept().await?;
-        let accept_at = Instant::now();
+        let accept_at = state.metrics.as_ref().map(|_| Instant::now());
         tune_socket(&stream);
         let state = Arc::clone(&state);
         tokio::spawn(async move {
@@ -160,17 +160,17 @@ impl BackendPool {
         trace: &mut RequestTrace,
         force_fresh: bool,
     ) -> io::Result<(TcpStream, SemaphorePermit<'_>)> {
-        let permit_start = Instant::now();
+        let permit_start = trace_instant(trace);
         let permit = self.permits.acquire().await.map_err(|_| {
             io::Error::new(io::ErrorKind::ConnectionAborted, "upstream pool closed")
         })?;
-        trace.pool_permit_wait_us += elapsed_us(permit_start);
+        trace.pool_permit_wait_us += elapsed_optional_us(permit_start);
 
         if !force_fresh {
             let stream = {
-                let idle_lock_start = Instant::now();
+                let idle_lock_start = trace_instant(trace);
                 let mut idle = self.idle.lock().await;
-                trace.idle_lock_us += elapsed_us(idle_lock_start);
+                trace.idle_lock_us += elapsed_optional_us(idle_lock_start);
                 idle.pop()
             };
             if let Some(stream) = stream {
@@ -179,17 +179,17 @@ impl BackendPool {
             }
             trace.idle_misses += 1;
         } else {
-            let idle_lock_start = Instant::now();
+            let idle_lock_start = trace_instant(trace);
             let mut idle = self.idle.lock().await;
-            trace.idle_lock_us += elapsed_us(idle_lock_start);
+            trace.idle_lock_us += elapsed_optional_us(idle_lock_start);
             idle.clear();
             trace.idle_misses += 1;
         }
 
-        let start = Instant::now();
+        let start = trace_instant(trace);
         let stream = TcpStream::connect(&self.addr).await?;
         tune_socket(&stream);
-        trace.upstream_connect_us += elapsed_us(start);
+        trace.upstream_connect_us += elapsed_optional_us(start);
         Ok((stream, permit))
     }
 
@@ -251,7 +251,7 @@ async fn warm_backend_pools(state: &LbState, target_idle: usize) {
 async fn handle_client(
     mut client: TcpStream,
     state: Arc<LbState>,
-    accept_at: Instant,
+    accept_at: Option<Instant>,
 ) -> io::Result<()> {
     let _client_guard = state.begin_client();
     let mut first_request_accept_at = Some(accept_at);
@@ -259,20 +259,35 @@ async fn handle_client(
     let mut response_buf = Vec::with_capacity(512);
 
     loop {
-        let total_start = Instant::now();
+        let trace_enabled = state.metrics.is_some();
+        let total_start = trace_enabled.then(Instant::now);
         let request_id = state
             .metrics
             .as_ref()
             .map(|metrics| metrics.next_request_id())
             .unwrap_or(0);
         let mut request_trace = RequestTrace {
+            enabled: trace_enabled,
             request_id,
-            accept_to_read_us: first_request_accept_at
-                .take()
-                .map(elapsed_us)
-                .unwrap_or_default(),
-            active_clients_at_start: state.active_clients.load(Ordering::Relaxed),
-            max_active_clients_seen: state.max_active_clients_seen(),
+            accept_to_read_us: if trace_enabled {
+                first_request_accept_at
+                    .take()
+                    .flatten()
+                    .map(elapsed_us)
+                    .unwrap_or_default()
+            } else {
+                0
+            },
+            active_clients_at_start: if trace_enabled {
+                state.active_clients.load(Ordering::Relaxed)
+            } else {
+                0
+            },
+            max_active_clients_seen: if trace_enabled {
+                state.max_active_clients_seen()
+            } else {
+                0
+            },
             ..RequestTrace::default()
         };
         let request = match read_request(&mut client, &mut read_buf, &mut request_trace).await {
@@ -292,11 +307,11 @@ async fn handle_client(
         let body_end = request.total_len;
 
         if state.upstream_protocol == UpstreamProtocol::Raw && request.route == Route::Ready {
-            let write_start = Instant::now();
+            let write_start = trace_instant(&request_trace);
             client.write_all(READY_OK).await?;
-            request_trace.client_write_us = elapsed_us(write_start);
+            request_trace.client_write_us = elapsed_optional_us(write_start);
             request_trace.total_us =
-                elapsed_us(total_start).saturating_sub(request_trace.client_wait_us);
+                elapsed_optional_us(total_start).saturating_sub(request_trace.client_wait_us);
             if let Some(metrics) = state.metrics.as_ref() {
                 metrics.record(request_trace, "ok");
             }
@@ -325,27 +340,27 @@ async fn handle_client(
         {
             Ok((used_backend, static_response)) => {
                 request_trace.backend_idx = used_backend as u8;
-                let write_start = Instant::now();
+                let write_start = trace_instant(&request_trace);
                 if let Some(response) = static_response {
                     client.write_all(response).await?;
                 } else {
                     client.write_all(&response_buf).await?;
                 }
-                request_trace.client_write_us = elapsed_us(write_start);
+                request_trace.client_write_us = elapsed_optional_us(write_start);
                 "ok"
             }
             Err(_) => {
                 request_trace.backend_idx = backend as u8;
                 request_trace.status_5xx = 1;
-                let write_start = Instant::now();
+                let write_start = trace_instant(&request_trace);
                 client.write_all(BAD_GATEWAY).await?;
-                request_trace.client_write_us = elapsed_us(write_start);
+                request_trace.client_write_us = elapsed_optional_us(write_start);
                 "bad_gateway"
             }
         };
 
         request_trace.total_us =
-            elapsed_us(total_start).saturating_sub(request_trace.client_wait_us);
+            elapsed_optional_us(total_start).saturating_sub(request_trace.client_wait_us);
         if let Some(metrics) = state.metrics.as_ref() {
             metrics.record(request_trace, status);
         }
@@ -460,18 +475,18 @@ async fn forward_once_http(
 ) -> io::Result<Option<&'static [u8]>> {
     let mut request_buf = [0u8; STACK_UPSTREAM_FRAME_BYTES];
     if let Some(frame) = build_upstream_request(request.route, host, body, &mut request_buf)? {
-        let write_start = Instant::now();
+        let write_start = trace_instant(trace);
         upstream.write_all(frame).await?;
-        trace.upstream_write_header_us += elapsed_us(write_start);
+        trace.upstream_write_header_us += elapsed_optional_us(write_start);
     } else {
         let mut header_buf = [0u8; 256];
         let header = build_upstream_header(request.route, host, body.len(), &mut header_buf)?;
-        let header_write_start = Instant::now();
+        let header_write_start = trace_instant(trace);
         upstream.write_all(header).await?;
-        trace.upstream_write_header_us += elapsed_us(header_write_start);
-        let body_write_start = Instant::now();
+        trace.upstream_write_header_us += elapsed_optional_us(header_write_start);
+        let body_write_start = trace_instant(trace);
         upstream.write_all(body).await?;
-        trace.upstream_write_body_us += elapsed_us(body_write_start);
+        trace.upstream_write_body_us += elapsed_optional_us(body_write_start);
     }
     trace.upstream_write_us = trace.upstream_write_header_us + trace.upstream_write_body_us;
 
@@ -500,7 +515,7 @@ async fn forward_once_raw(
     }
 
     let len = body.len();
-    let write_start = Instant::now();
+    let write_start = trace_instant(trace);
     if RAW_FRAME_HEADER_BYTES + len <= STACK_UPSTREAM_FRAME_BYTES {
         let mut frame = [0u8; STACK_UPSTREAM_FRAME_BYTES];
         frame[..RAW_FRAME_HEADER_BYTES].copy_from_slice(&(len as u16).to_be_bytes());
@@ -514,13 +529,13 @@ async fn forward_once_raw(
         frame.extend_from_slice(body);
         upstream.write_all(&frame).await?;
     }
-    trace.upstream_write_body_us += elapsed_us(write_start);
+    trace.upstream_write_body_us += elapsed_optional_us(write_start);
     trace.upstream_write_us = trace.upstream_write_header_us + trace.upstream_write_body_us;
 
     let mut code = [0u8; 1];
-    let response_start = Instant::now();
+    let response_start = trace_instant(trace);
     upstream.read_exact(&mut code).await?;
-    trace.upstream_wait_header_us += elapsed_us(response_start);
+    trace.upstream_wait_header_us += elapsed_optional_us(response_start);
 
     let response = if code[0] == RAW_BAD_REQUEST {
         BAD_REQUEST
@@ -667,7 +682,7 @@ async fn read_response(
     trace: &mut RequestTrace,
 ) -> io::Result<()> {
     let mut tmp = [0u8; READ_CHUNK_BYTES];
-    let header_start = Instant::now();
+    let header_start = trace_instant(trace);
     let header_end = loop {
         if let Some(pos) = find_header_end(response_buf) {
             break pos + 4;
@@ -689,12 +704,12 @@ async fn read_response(
         }
         response_buf.extend_from_slice(&tmp[..n]);
     };
-    trace.upstream_wait_header_us += elapsed_us(header_start);
+    trace.upstream_wait_header_us += elapsed_optional_us(header_start);
 
     let content_length = parse_response_content_length(&response_buf[..header_end])?;
     let total_len = header_end + content_length;
     if response_buf.len() < total_len {
-        let body_start = Instant::now();
+        let body_start = trace_instant(trace);
         while response_buf.len() < total_len {
             let n = upstream.read(&mut tmp).await?;
             if n == 0 {
@@ -705,7 +720,7 @@ async fn read_response(
             }
             response_buf.extend_from_slice(&tmp[..n]);
         }
-        trace.upstream_read_body_us += elapsed_us(body_start);
+        trace.upstream_read_body_us += elapsed_optional_us(body_start);
     }
 
     if response_buf.len() > total_len {
@@ -756,9 +771,9 @@ async fn read_request<R: AsyncRead + Unpin>(
     loop {
         if let Some(header_end_without_delim) = find_header_end(buf) {
             let header_len = header_end_without_delim + 4;
-            let parse_start = Instant::now();
+            let parse_start = trace_instant(trace);
             let head = parse_request_head(&buf[..header_len])?;
-            trace.request_parse_us += elapsed_us(parse_start);
+            trace.request_parse_us += elapsed_optional_us(parse_start);
             let total_len = header_len + head.content_length;
             if total_len > MAX_HEADER_BYTES + MAX_BODY_BYTES {
                 return Err(ClientReadError {
@@ -779,11 +794,11 @@ async fn read_request<R: AsyncRead + Unpin>(
             });
         }
 
-        let read_start = Instant::now();
+        let read_start = trace_instant(trace);
         let n = reader.read(&mut tmp).await.map_err(|_| ClientReadError {
             response: BAD_REQUEST,
         })?;
-        let read_us = elapsed_us(read_start);
+        let read_us = elapsed_optional_us(read_start);
         if n == 0 {
             if buf.is_empty() {
                 return Ok(None);
@@ -1073,6 +1088,7 @@ fn tune_socket(stream: &TcpStream) {
 
 #[derive(Default, Clone, Copy)]
 pub struct RequestTrace {
+    pub enabled: bool,
     pub request_id: u64,
     pub route: &'static str,
     pub body_len: u64,
@@ -1246,6 +1262,16 @@ fn percentile(values: &[u64], pct: usize) -> u64 {
 #[inline]
 fn elapsed_us(start: Instant) -> u64 {
     start.elapsed().as_micros() as u64
+}
+
+#[inline]
+fn trace_instant(trace: &RequestTrace) -> Option<Instant> {
+    trace.enabled.then(Instant::now)
+}
+
+#[inline]
+fn elapsed_optional_us(start: Option<Instant>) -> u64 {
+    start.map(elapsed_us).unwrap_or_default()
 }
 
 #[cfg(test)]

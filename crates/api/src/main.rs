@@ -70,8 +70,11 @@ async fn fraud_score(
     State(state): State<AppState>,
     body_bytes: Bytes,
 ) -> Result<Response, StatusCode> {
-    let handler_start = Instant::now();
-
+    let handler_start = if state.perf.is_some() || state.log_search_avg {
+        Some(Instant::now())
+    } else {
+        None
+    };
     let bucket = score_body(&state, &body_bytes, handler_start, true)?;
     response_for_bucket(bucket)
 }
@@ -104,10 +107,11 @@ fn score_bucket_for_fraud_score(fraud_score_val: f64) -> u8 {
 fn score_body(
     state: &AppState,
     body_bytes: &[u8],
-    handler_start: Instant,
+    handler_start: Option<Instant>,
     build_response: bool,
 ) -> Result<u8, StatusCode> {
     if let Some(perf) = state.perf.as_deref() {
+        let handler_start = handler_start.unwrap_or_else(Instant::now);
         let request = perf.begin_request();
 
         let parse_start = Instant::now();
@@ -180,7 +184,9 @@ fn score_body(
     };
 
     if state.log_search_avg {
-        let elapsed = handler_start.elapsed().as_micros() as u64;
+        let elapsed = handler_start
+            .map(|start| start.elapsed().as_micros() as u64)
+            .unwrap_or_default();
         let count = REQ_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
         let total = TOTAL_US.fetch_add(elapsed, Ordering::Relaxed) + elapsed;
 
@@ -234,7 +240,11 @@ async fn handle_raw_connection(mut stream: TcpStream, state: AppState) -> io::Re
         let body_slice = &mut body[..body_len];
         stream.read_exact(body_slice).await?;
 
-        let handler_start = Instant::now();
+        let handler_start = if state.perf.is_some() || state.log_search_avg {
+            Some(Instant::now())
+        } else {
+            None
+        };
         let bucket = match score_body(&state, body_slice, handler_start, false) {
             Ok(bucket) => bucket,
             Err(_) => RAW_BAD_REQUEST,
