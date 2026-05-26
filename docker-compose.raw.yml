@@ -1,0 +1,13 @@
+services:
+  lb:
+    environment:
+      - BACKENDS=api1:8081,api2:8081
+      - UPSTREAM_PROTOCOL=raw
+
+  api1:
+    environment:
+      - API_RAW_LISTEN=0.0.0.0:8081
+
+  api2:
+    environment:
+      - API_RAW_LISTEN=0.0.0.0:8081

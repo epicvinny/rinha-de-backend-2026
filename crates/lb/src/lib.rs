@@ -23,11 +23,30 @@ const PAYLOAD_TOO_LARGE: &[u8] =
     b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 const BAD_GATEWAY: &[u8] =
     b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+const READY_OK: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n";
+
+const RAW_BAD_REQUEST: u8 = 255;
+const RAW_FRAME_HEADER_BYTES: usize = 2;
+const STACK_UPSTREAM_FRAME_BYTES: usize = 1024;
+
+const SCORE_0_RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 33\r\nConnection: keep-alive\r\n\r\n{\"approved\":true,\"fraud_score\":0}";
+const SCORE_1_RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 35\r\nConnection: keep-alive\r\n\r\n{\"approved\":true,\"fraud_score\":0.2}";
+const SCORE_2_RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 35\r\nConnection: keep-alive\r\n\r\n{\"approved\":true,\"fraud_score\":0.4}";
+const SCORE_3_RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 36\r\nConnection: keep-alive\r\n\r\n{\"approved\":false,\"fraud_score\":0.6}";
+const SCORE_4_RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 36\r\nConnection: keep-alive\r\n\r\n{\"approved\":false,\"fraud_score\":0.8}";
+const SCORE_5_RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 34\r\nConnection: keep-alive\r\n\r\n{\"approved\":false,\"fraud_score\":1}";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UpstreamProtocol {
+    Http,
+    Raw,
+}
 
 #[derive(Clone)]
 pub struct LbConfig {
     pub listen: SocketAddr,
     pub backends: [String; 2],
+    pub upstream_protocol: UpstreamProtocol,
     pub upstream_pool_per_backend: usize,
     pub upstream_preconnect_per_backend: usize,
     pub metrics: Option<Metrics>,
@@ -40,17 +59,21 @@ pub async fn run(config: LbConfig) -> io::Result<()> {
             BackendPool::new(config.backends[0].clone(), config.upstream_pool_per_backend),
             BackendPool::new(config.backends[1].clone(), config.upstream_pool_per_backend),
         ],
+        upstream_protocol: config.upstream_protocol,
         next_backend: AtomicU64::new(0),
+        active_clients: AtomicU64::new(0),
+        max_active_clients: AtomicU64::new(0),
         metrics: config.metrics,
     });
     warm_backend_pools(&state, config.upstream_preconnect_per_backend).await;
 
     loop {
         let (stream, _) = listener.accept().await?;
+        let accept_at = Instant::now();
         tune_socket(&stream);
         let state = Arc::clone(&state);
         tokio::spawn(async move {
-            if let Err(err) = handle_client(stream, state).await {
+            if let Err(err) = handle_client(stream, state, accept_at).await {
                 if err.kind() != io::ErrorKind::UnexpectedEof {
                     eprintln!("lb client error: {}", err);
                 }
@@ -61,7 +84,10 @@ pub async fn run(config: LbConfig) -> io::Result<()> {
 
 struct LbState {
     backends: [BackendPool; 2],
+    upstream_protocol: UpstreamProtocol,
     next_backend: AtomicU64,
+    active_clients: AtomicU64,
+    max_active_clients: AtomicU64,
     metrics: Option<Metrics>,
 }
 
@@ -69,6 +95,41 @@ impl LbState {
     #[inline]
     fn choose_backend(&self) -> usize {
         (self.next_backend.fetch_add(1, Ordering::Relaxed) & 1) as usize
+    }
+
+    fn begin_client(&self) -> ClientGuard<'_> {
+        let active = self.active_clients.fetch_add(1, Ordering::Relaxed) + 1;
+        self.update_max_active_clients(active);
+        ClientGuard { state: self }
+    }
+
+    fn max_active_clients_seen(&self) -> u64 {
+        self.max_active_clients.load(Ordering::Relaxed)
+    }
+
+    fn update_max_active_clients(&self, value: u64) {
+        let mut current = self.max_active_clients.load(Ordering::Relaxed);
+        while value > current {
+            match self.max_active_clients.compare_exchange_weak(
+                current,
+                value,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(next) => current = next,
+            }
+        }
+    }
+}
+
+struct ClientGuard<'a> {
+    state: &'a LbState,
+}
+
+impl Drop for ClientGuard<'_> {
+    fn drop(&mut self) {
+        self.state.active_clients.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -99,21 +160,30 @@ impl BackendPool {
         trace: &mut RequestTrace,
         force_fresh: bool,
     ) -> io::Result<(TcpStream, SemaphorePermit<'_>)> {
+        let permit_start = Instant::now();
         let permit = self.permits.acquire().await.map_err(|_| {
             io::Error::new(io::ErrorKind::ConnectionAborted, "upstream pool closed")
         })?;
+        trace.pool_permit_wait_us += elapsed_us(permit_start);
 
         if !force_fresh {
             let stream = {
+                let idle_lock_start = Instant::now();
                 let mut idle = self.idle.lock().await;
+                trace.idle_lock_us += elapsed_us(idle_lock_start);
                 idle.pop()
             };
             if let Some(stream) = stream {
+                trace.idle_hits += 1;
                 return Ok((stream, permit));
             }
+            trace.idle_misses += 1;
         } else {
+            let idle_lock_start = Instant::now();
             let mut idle = self.idle.lock().await;
+            trace.idle_lock_us += elapsed_us(idle_lock_start);
             idle.clear();
+            trace.idle_misses += 1;
         }
 
         let start = Instant::now();
@@ -178,14 +248,34 @@ async fn warm_backend_pools(state: &LbState, target_idle: usize) {
     }
 }
 
-async fn handle_client(mut client: TcpStream, state: Arc<LbState>) -> io::Result<()> {
+async fn handle_client(
+    mut client: TcpStream,
+    state: Arc<LbState>,
+    accept_at: Instant,
+) -> io::Result<()> {
+    let _client_guard = state.begin_client();
+    let mut first_request_accept_at = Some(accept_at);
     let mut read_buf = Vec::with_capacity(1024);
     let mut response_buf = Vec::with_capacity(512);
 
     loop {
         let total_start = Instant::now();
-        let read_start = Instant::now();
-        let request = match read_request(&mut client, &mut read_buf).await {
+        let request_id = state
+            .metrics
+            .as_ref()
+            .map(|metrics| metrics.next_request_id())
+            .unwrap_or(0);
+        let mut request_trace = RequestTrace {
+            request_id,
+            accept_to_read_us: first_request_accept_at
+                .take()
+                .map(elapsed_us)
+                .unwrap_or_default(),
+            active_clients_at_start: state.active_clients.load(Ordering::Relaxed),
+            max_active_clients_seen: state.max_active_clients_seen(),
+            ..RequestTrace::default()
+        };
+        let request = match read_request(&mut client, &mut read_buf, &mut request_trace).await {
             Ok(Some(request)) => request,
             Ok(None) => return Ok(()),
             Err(err) => {
@@ -195,13 +285,32 @@ async fn handle_client(mut client: TcpStream, state: Arc<LbState>) -> io::Result
             }
         };
 
-        let mut request_trace = RequestTrace {
-            client_read_us: elapsed_us(read_start),
-            ..RequestTrace::default()
-        };
+        request_trace.route = request.route.as_str();
+        request_trace.body_len = request.total_len.saturating_sub(request.header_len) as u64;
 
         let body_start = request.header_len;
         let body_end = request.total_len;
+
+        if state.upstream_protocol == UpstreamProtocol::Raw && request.route == Route::Ready {
+            let write_start = Instant::now();
+            client.write_all(READY_OK).await?;
+            request_trace.client_write_us = elapsed_us(write_start);
+            request_trace.total_us =
+                elapsed_us(total_start).saturating_sub(request_trace.client_wait_us);
+            if let Some(metrics) = state.metrics.as_ref() {
+                metrics.record(request_trace, "ok");
+            }
+            if request.total_len == read_buf.len() {
+                read_buf.clear();
+            } else {
+                read_buf.drain(..request.total_len);
+            }
+            if request.close_after_response {
+                return Ok(());
+            }
+            continue;
+        }
+
         let backend = state.choose_backend();
 
         let status = match proxy_with_retries(
@@ -231,7 +340,8 @@ async fn handle_client(mut client: TcpStream, state: Arc<LbState>) -> io::Result
             }
         };
 
-        request_trace.total_us = elapsed_us(total_start);
+        request_trace.total_us =
+            elapsed_us(total_start).saturating_sub(request_trace.client_wait_us);
         if let Some(metrics) = state.metrics.as_ref() {
             metrics.record(request_trace, status);
         }
@@ -281,6 +391,7 @@ async fn proxy_with_retries(
             body,
             response_buf,
             trace,
+            state.upstream_protocol,
         )
         .await;
 
@@ -313,15 +424,52 @@ async fn forward_once(
     body: &[u8],
     response_buf: &mut Vec<u8>,
     trace: &mut RequestTrace,
+    protocol: UpstreamProtocol,
 ) -> io::Result<()> {
-    let write_start = Instant::now();
-    let mut header_buf = [0u8; 256];
-    let header = build_upstream_header(request.route, host, body.len(), &mut header_buf)?;
-    upstream.write_all(header).await?;
-    if request.route == Route::FraudScore {
-        upstream.write_all(body).await?;
+    match protocol {
+        UpstreamProtocol::Http => {
+            forward_once_http(
+                upstream,
+                backend_idx,
+                host,
+                request,
+                body,
+                response_buf,
+                trace,
+            )
+            .await
+        }
+        UpstreamProtocol::Raw => {
+            forward_once_raw(upstream, backend_idx, request, body, response_buf, trace).await
+        }
     }
-    trace.upstream_write_us += elapsed_us(write_start);
+}
+
+async fn forward_once_http(
+    upstream: &mut TcpStream,
+    backend_idx: usize,
+    host: &str,
+    request: &ParsedRequest,
+    body: &[u8],
+    response_buf: &mut Vec<u8>,
+    trace: &mut RequestTrace,
+) -> io::Result<()> {
+    let mut request_buf = [0u8; STACK_UPSTREAM_FRAME_BYTES];
+    if let Some(frame) = build_upstream_request(request.route, host, body, &mut request_buf)? {
+        let write_start = Instant::now();
+        upstream.write_all(frame).await?;
+        trace.upstream_write_header_us += elapsed_us(write_start);
+    } else {
+        let mut header_buf = [0u8; 256];
+        let header = build_upstream_header(request.route, host, body.len(), &mut header_buf)?;
+        let header_write_start = Instant::now();
+        upstream.write_all(header).await?;
+        trace.upstream_write_header_us += elapsed_us(header_write_start);
+        let body_write_start = Instant::now();
+        upstream.write_all(body).await?;
+        trace.upstream_write_body_us += elapsed_us(body_write_start);
+    }
+    trace.upstream_write_us = trace.upstream_write_header_us + trace.upstream_write_body_us;
 
     read_response(upstream, response_buf, trace).await?;
     if backend_idx == 0 {
@@ -330,6 +478,75 @@ async fn forward_once(
         trace.backend1 = 1;
     }
     Ok(())
+}
+
+async fn forward_once_raw(
+    upstream: &mut TcpStream,
+    backend_idx: usize,
+    request: &ParsedRequest,
+    body: &[u8],
+    response_buf: &mut Vec<u8>,
+    trace: &mut RequestTrace,
+) -> io::Result<()> {
+    if request.route != Route::FraudScore || body.len() > u16::MAX as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "raw upstream only supports fraud-score bodies",
+        ));
+    }
+
+    let len = body.len();
+    let write_start = Instant::now();
+    if RAW_FRAME_HEADER_BYTES + len <= STACK_UPSTREAM_FRAME_BYTES {
+        let mut frame = [0u8; STACK_UPSTREAM_FRAME_BYTES];
+        frame[..RAW_FRAME_HEADER_BYTES].copy_from_slice(&(len as u16).to_be_bytes());
+        frame[RAW_FRAME_HEADER_BYTES..RAW_FRAME_HEADER_BYTES + len].copy_from_slice(body);
+        upstream
+            .write_all(&frame[..RAW_FRAME_HEADER_BYTES + len])
+            .await?;
+    } else {
+        let mut frame = Vec::with_capacity(RAW_FRAME_HEADER_BYTES + len);
+        frame.extend_from_slice(&(len as u16).to_be_bytes());
+        frame.extend_from_slice(body);
+        upstream.write_all(&frame).await?;
+    }
+    trace.upstream_write_body_us += elapsed_us(write_start);
+    trace.upstream_write_us = trace.upstream_write_header_us + trace.upstream_write_body_us;
+
+    let mut code = [0u8; 1];
+    let response_start = Instant::now();
+    upstream.read_exact(&mut code).await?;
+    trace.upstream_wait_header_us += elapsed_us(response_start);
+
+    if code[0] == RAW_BAD_REQUEST {
+        response_buf.extend_from_slice(BAD_REQUEST);
+    } else if let Some(response) = response_for_bucket(code[0]) {
+        response_buf.extend_from_slice(response);
+    } else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "raw upstream returned invalid score bucket",
+        ));
+    }
+
+    if backend_idx == 0 {
+        trace.backend0 = 1;
+    } else {
+        trace.backend1 = 1;
+    }
+    Ok(())
+}
+
+fn response_for_bucket(bucket: u8) -> Option<&'static [u8]> {
+    match bucket {
+        0 => Some(SCORE_0_RESPONSE),
+        1 => Some(SCORE_1_RESPONSE),
+        2 => Some(SCORE_2_RESPONSE),
+        3 => Some(SCORE_3_RESPONSE),
+        4 => Some(SCORE_4_RESPONSE),
+        5 => Some(SCORE_5_RESPONSE),
+        _ => None,
+    }
 }
 
 fn build_upstream_header<'a>(
@@ -362,6 +579,43 @@ fn build_upstream_header<'a>(
         }
     }
     Ok(&out[..len])
+}
+
+fn build_upstream_request<'a>(
+    route: Route,
+    host: &str,
+    body: &[u8],
+    out: &'a mut [u8; STACK_UPSTREAM_FRAME_BYTES],
+) -> io::Result<Option<&'a [u8]>> {
+    let mut len = 0usize;
+    match route {
+        Route::Ready => {
+            push_bytes(out, &mut len, b"GET /ready HTTP/1.1\r\nHost: ")?;
+            push_bytes(out, &mut len, host.as_bytes())?;
+            push_bytes(
+                out,
+                &mut len,
+                b"\r\nConnection: keep-alive\r\nContent-Length: 0\r\n\r\n",
+            )?;
+        }
+        Route::FraudScore => {
+            push_bytes(out, &mut len, b"POST /fraud-score HTTP/1.1\r\nHost: ")?;
+            push_bytes(out, &mut len, host.as_bytes())?;
+            push_bytes(
+                out,
+                &mut len,
+                b"\r\nContent-Type: application/json\r\nContent-Length: ",
+            )?;
+            push_usize_decimal(out, &mut len, body.len())?;
+            push_bytes(out, &mut len, b"\r\nConnection: keep-alive\r\n\r\n")?;
+            if len + body.len() > out.len() {
+                return Ok(None);
+            }
+            out[len..len + body.len()].copy_from_slice(body);
+            len += body.len();
+        }
+    }
+    Ok(Some(&out[..len]))
 }
 
 fn push_bytes(out: &mut [u8], len: &mut usize, bytes: &[u8]) -> io::Result<()> {
@@ -464,6 +718,16 @@ enum Route {
     FraudScore,
 }
 
+impl Route {
+    #[inline]
+    fn as_str(self) -> &'static str {
+        match self {
+            Route::Ready => "ready",
+            Route::FraudScore => "fraud_score",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ParsedRequest {
     route: Route,
@@ -480,13 +744,17 @@ struct ClientReadError {
 async fn read_request<R: AsyncRead + Unpin>(
     reader: &mut R,
     buf: &mut Vec<u8>,
+    trace: &mut RequestTrace,
 ) -> Result<Option<ParsedRequest>, ClientReadError> {
     let mut tmp = [0u8; READ_CHUNK_BYTES];
+    let mut saw_request_bytes = !buf.is_empty();
 
     loop {
         if let Some(header_end_without_delim) = find_header_end(buf) {
             let header_len = header_end_without_delim + 4;
+            let parse_start = Instant::now();
             let head = parse_request_head(&buf[..header_len])?;
+            trace.request_parse_us += elapsed_us(parse_start);
             let total_len = header_len + head.content_length;
             if total_len > MAX_HEADER_BYTES + MAX_BODY_BYTES {
                 return Err(ClientReadError {
@@ -507,9 +775,11 @@ async fn read_request<R: AsyncRead + Unpin>(
             });
         }
 
+        let read_start = Instant::now();
         let n = reader.read(&mut tmp).await.map_err(|_| ClientReadError {
             response: BAD_REQUEST,
         })?;
+        let read_us = elapsed_us(read_start);
         if n == 0 {
             if buf.is_empty() {
                 return Ok(None);
@@ -517,6 +787,12 @@ async fn read_request<R: AsyncRead + Unpin>(
             return Err(ClientReadError {
                 response: BAD_REQUEST,
             });
+        }
+        if saw_request_bytes {
+            trace.client_read_us += read_us;
+        } else {
+            trace.client_wait_us += read_us;
+            saw_request_bytes = true;
         }
         buf.extend_from_slice(&tmp[..n]);
     }
@@ -674,9 +950,19 @@ fn tune_socket(stream: &TcpStream) {
 
 #[derive(Default, Clone, Copy)]
 pub struct RequestTrace {
+    pub request_id: u64,
+    pub route: &'static str,
+    pub body_len: u64,
+    pub accept_to_read_us: u64,
+    pub client_wait_us: u64,
     pub client_read_us: u64,
+    pub request_parse_us: u64,
+    pub pool_permit_wait_us: u64,
+    pub idle_lock_us: u64,
     pub upstream_connect_us: u64,
     pub upstream_write_us: u64,
+    pub upstream_write_header_us: u64,
+    pub upstream_write_body_us: u64,
     pub upstream_wait_header_us: u64,
     pub upstream_read_body_us: u64,
     pub client_write_us: u64,
@@ -684,6 +970,10 @@ pub struct RequestTrace {
     pub backend_idx: u8,
     pub backend0: u64,
     pub backend1: u64,
+    pub idle_hits: u64,
+    pub idle_misses: u64,
+    pub active_clients_at_start: u64,
+    pub max_active_clients_seen: u64,
     pub retries: u64,
     pub reconnects: u64,
     pub status_5xx: u64,
@@ -692,18 +982,34 @@ pub struct RequestTrace {
 #[derive(Clone)]
 pub struct Metrics {
     every: usize,
+    slow_us: u64,
+    sample: u64,
+    request_seq: Arc<AtomicU64>,
     window: Arc<Mutex<Vec<RequestTrace>>>,
 }
 
 impl Metrics {
-    pub fn new(every: usize) -> Self {
+    pub fn new(every: usize, slow_us: u64, sample: u64) -> Self {
         Self {
             every,
+            slow_us,
+            sample,
+            request_seq: Arc::new(AtomicU64::new(0)),
             window: Arc::new(Mutex::new(Vec::with_capacity(every))),
         }
     }
 
+    fn next_request_id(&self) -> u64 {
+        self.request_seq.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
     fn record(&self, trace: RequestTrace, status: &str) {
+        if trace.total_us >= self.slow_us {
+            emit_request_trace("lb_slow_request", trace, status);
+        } else if self.sample > 0 && trace.request_id % self.sample == 0 {
+            emit_request_trace("lb_sample_request", trace, status);
+        }
+
         let flush = {
             let mut window = self.window.lock().expect("lb metrics poisoned");
             window.push(trace);
@@ -723,25 +1029,72 @@ impl Metrics {
 fn emit_summary(records: &[RequestTrace], last_status: &str) {
     let backend0: u64 = records.iter().map(|r| r.backend0).sum();
     let backend1: u64 = records.iter().map(|r| r.backend1).sum();
+    let idle_hits: u64 = records.iter().map(|r| r.idle_hits).sum();
+    let idle_misses: u64 = records.iter().map(|r| r.idle_misses).sum();
     let retries: u64 = records.iter().map(|r| r.retries).sum();
     let reconnects: u64 = records.iter().map(|r| r.reconnects).sum();
     let status_5xx: u64 = records.iter().map(|r| r.status_5xx).sum();
     eprintln!(
-        "{{\"kind\":\"lb_summary\",\"requests\":{},\"last_status\":\"{}\",\"backend0\":{},\"backend1\":{},\"retries\":{},\"reconnects\":{},\"status_5xx\":{},\"timings_us\":{{\"client_read\":{},\"upstream_connect\":{},\"upstream_write\":{},\"upstream_wait_header\":{},\"upstream_read_body\":{},\"client_write\":{},\"total\":{}}}}}",
+        "{{\"kind\":\"lb_summary\",\"requests\":{},\"last_status\":\"{}\",\"backend0\":{},\"backend1\":{},\"idle_hits\":{},\"idle_misses\":{},\"retries\":{},\"reconnects\":{},\"status_5xx\":{},\"client_concurrency\":{{\"at_start\":{},\"max_seen\":{}}},\"request_counters\":{{\"body_len\":{}}},\"timings_us\":{{\"accept_to_read\":{},\"client_wait\":{},\"client_read\":{},\"request_parse\":{},\"pool_permit_wait\":{},\"idle_lock\":{},\"upstream_connect\":{},\"upstream_write\":{},\"upstream_write_header\":{},\"upstream_write_body\":{},\"upstream_wait_header\":{},\"upstream_read_body\":{},\"client_write\":{},\"total\":{}}}}}",
         records.len(),
         last_status,
         backend0,
         backend1,
+        idle_hits,
+        idle_misses,
         retries,
         reconnects,
         status_5xx,
+        stats_json(records.iter().map(|r| r.active_clients_at_start).collect()),
+        stats_json(records.iter().map(|r| r.max_active_clients_seen).collect()),
+        stats_json(records.iter().map(|r| r.body_len).collect()),
+        stats_json(records.iter().map(|r| r.accept_to_read_us).collect()),
+        stats_json(records.iter().map(|r| r.client_wait_us).collect()),
         stats_json(records.iter().map(|r| r.client_read_us).collect()),
+        stats_json(records.iter().map(|r| r.request_parse_us).collect()),
+        stats_json(records.iter().map(|r| r.pool_permit_wait_us).collect()),
+        stats_json(records.iter().map(|r| r.idle_lock_us).collect()),
         stats_json(records.iter().map(|r| r.upstream_connect_us).collect()),
         stats_json(records.iter().map(|r| r.upstream_write_us).collect()),
+        stats_json(records.iter().map(|r| r.upstream_write_header_us).collect()),
+        stats_json(records.iter().map(|r| r.upstream_write_body_us).collect()),
         stats_json(records.iter().map(|r| r.upstream_wait_header_us).collect()),
         stats_json(records.iter().map(|r| r.upstream_read_body_us).collect()),
         stats_json(records.iter().map(|r| r.client_write_us).collect()),
         stats_json(records.iter().map(|r| r.total_us).collect()),
+    );
+}
+
+fn emit_request_trace(kind: &str, trace: RequestTrace, status: &str) {
+    eprintln!(
+        "{{\"kind\":\"{}\",\"request_id\":{},\"status\":\"{}\",\"route\":\"{}\",\"backend_idx\":{},\"body_len\":{},\"idle_hits\":{},\"idle_misses\":{},\"retries\":{},\"reconnects\":{},\"status_5xx\":{},\"client_concurrency\":{{\"at_start\":{},\"max_seen\":{}}},\"timings_us\":{{\"accept_to_read\":{},\"client_wait\":{},\"client_read\":{},\"request_parse\":{},\"pool_permit_wait\":{},\"idle_lock\":{},\"upstream_connect\":{},\"upstream_write\":{},\"upstream_write_header\":{},\"upstream_write_body\":{},\"upstream_wait_header\":{},\"upstream_read_body\":{},\"client_write\":{},\"total\":{}}}}}",
+        kind,
+        trace.request_id,
+        status,
+        trace.route,
+        trace.backend_idx,
+        trace.body_len,
+        trace.idle_hits,
+        trace.idle_misses,
+        trace.retries,
+        trace.reconnects,
+        trace.status_5xx,
+        trace.active_clients_at_start,
+        trace.max_active_clients_seen,
+        trace.accept_to_read_us,
+        trace.client_wait_us,
+        trace.client_read_us,
+        trace.request_parse_us,
+        trace.pool_permit_wait_us,
+        trace.idle_lock_us,
+        trace.upstream_connect_us,
+        trace.upstream_write_us,
+        trace.upstream_write_header_us,
+        trace.upstream_write_body_us,
+        trace.upstream_wait_header_us,
+        trace.upstream_read_body_us,
+        trace.client_write_us,
+        trace.total_us,
     );
 }
 
@@ -827,7 +1180,8 @@ mod tests {
         });
 
         let mut buf = Vec::new();
-        let req = read_request(&mut server, &mut buf)
+        let mut trace = RequestTrace::default();
+        let req = read_request(&mut server, &mut buf, &mut trace)
             .await
             .unwrap()
             .expect("request");
@@ -849,10 +1203,17 @@ mod tests {
         });
 
         let mut buf = Vec::new();
-        let first = read_request(&mut server, &mut buf).await.unwrap().unwrap();
+        let mut trace = RequestTrace::default();
+        let first = read_request(&mut server, &mut buf, &mut trace)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(first.route, Route::Ready);
         buf.drain(..first.total_len);
-        let second = read_request(&mut server, &mut buf).await.unwrap().unwrap();
+        let second = read_request(&mut server, &mut buf, &mut trace)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(second.route, Route::Ready);
     }
 
@@ -880,5 +1241,15 @@ mod tests {
             header,
             b"GET /ready HTTP/1.1\r\nHost: api2:8080\r\nConnection: keep-alive\r\nContent-Length: 0\r\n\r\n"
         );
+    }
+
+    #[test]
+    fn raw_score_responses_have_valid_content_length() {
+        for bucket in 0..=5 {
+            let response = response_for_bucket(bucket).unwrap();
+            let header_end = find_header_end(response).unwrap() + 4;
+            let content_length = parse_response_content_length(&response[..header_end]).unwrap();
+            assert_eq!(content_length, response.len() - header_end);
+        }
     }
 }

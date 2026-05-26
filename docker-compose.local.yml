@@ -1,0 +1,9 @@
+services:
+  lb:
+    image: rinha-2026-perf:local
+
+  api1:
+    image: rinha-2026-perf:local
+
+  api2:
+    image: rinha-2026-perf:local

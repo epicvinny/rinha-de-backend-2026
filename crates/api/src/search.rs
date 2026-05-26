@@ -63,6 +63,15 @@ pub trait SearchTraceSink {
     fn record_branch_bound_us(&mut self, _value: u64) {}
 
     #[inline]
+    fn record_home_tree_us(&mut self, _value: u64) {}
+
+    #[inline]
+    fn record_root_filter_us(&mut self, _value: u64) {}
+
+    #[inline]
+    fn record_node_best_first_us(&mut self, _value: u64) {}
+
+    #[inline]
     fn record_label_score_us(&mut self, _value: u64) {}
 
     #[inline]
@@ -76,6 +85,9 @@ pub trait SearchTraceSink {
 
     #[inline]
     fn add_branch_scan(&mut self, _vectors: u32) {}
+
+    #[inline]
+    fn add_leaf_scan_us(&mut self, _value: u64, _vectors: u32) {}
 
     #[inline]
     fn inc_visited_cells(&mut self) {}
@@ -94,6 +106,24 @@ pub trait SearchTraceSink {
 
     #[inline]
     fn inc_pruned_nodes(&mut self) {}
+
+    #[inline]
+    fn inc_root_candidates(&mut self) {}
+
+    #[inline]
+    fn inc_root_cell_pruned(&mut self) {}
+
+    #[inline]
+    fn inc_root_bbox_pruned(&mut self) {}
+
+    #[inline]
+    fn observe_node_queue_len(&mut self, _value: usize) {}
+
+    #[inline]
+    fn inc_node_queue_overflows(&mut self) {}
+
+    #[inline]
+    fn inc_dfs_fallbacks(&mut self) {}
 }
 
 pub struct NoopTrace;
@@ -394,7 +424,15 @@ fn search_tree<T: SearchTraceSink>(
     let home = view.tree_root_entry(query_key);
     trace.set_home_cell_count(home.count);
     if home.root != EMPTY_NODE {
+        let home_start = if trace.enabled() {
+            Some(Instant::now())
+        } else {
+            None
+        };
         traverse_tree(view, qv16, home.root, topk, trace);
+        if let Some(start) = home_start {
+            trace.record_home_tree_us(start.elapsed().as_micros() as u64);
+        }
     }
 
     let mut candidates = [RootCandidate {
@@ -404,6 +442,11 @@ fn search_tree<T: SearchTraceSink>(
     }; 8192];
     let mut candidate_len = 0usize;
 
+    let root_filter_start = if trace.enabled() {
+        Some(Instant::now())
+    } else {
+        None
+    };
     for idx in 0..view.n_populated_tree_roots() {
         let key = view.populated_tree_key_at(idx);
         if key == query_key {
@@ -418,6 +461,7 @@ fn search_tree<T: SearchTraceSink>(
         let cell_lb = cell_lower_bound_sq(qv16, query_key, key);
         if !can_bound_improve(topk, cell_lb, root.min_original_id) {
             trace.inc_pruned_nodes();
+            trace.inc_root_cell_pruned();
             continue;
         }
 
@@ -429,12 +473,25 @@ fn search_tree<T: SearchTraceSink>(
                 lower_bound: lb,
             };
             candidate_len += 1;
+            trace.inc_root_candidates();
         } else {
             trace.inc_pruned_nodes();
+            trace.inc_root_bbox_pruned();
         }
     }
+    if let Some(start) = root_filter_start {
+        trace.record_root_filter_us(start.elapsed().as_micros() as u64);
+    }
 
+    let node_best_first_start = if trace.enabled() {
+        Some(Instant::now())
+    } else {
+        None
+    };
     traverse_candidates_best_first(view, qv16, &candidates[..candidate_len], topk, trace);
+    if let Some(start) = node_best_first_start {
+        trace.record_node_best_first_us(start.elapsed().as_micros() as u64);
+    }
 
     if let Some(start) = branch_start {
         trace.record_branch_bound_us(start.elapsed().as_micros() as u64);
@@ -502,6 +559,11 @@ impl NodeQueue {
     }
 
     #[inline]
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline]
     fn pop(&mut self) -> Option<NodeCandidate> {
         if self.len == 0 {
             return None;
@@ -556,8 +618,10 @@ fn traverse_candidates_best_first<T: SearchTraceSink>(
                 lower_bound: candidate.lower_bound,
             }) {
                 overflow = true;
+                trace.inc_node_queue_overflows();
                 break;
             }
+            trace.observe_node_queue_len(queue.len());
         } else {
             trace.inc_pruned_nodes();
         }
@@ -582,7 +646,15 @@ fn traverse_candidates_best_first<T: SearchTraceSink>(
         trace.inc_nodes_visited();
         if node.is_leaf() {
             trace.inc_leaves_scanned();
+            let leaf_start = if trace.enabled() {
+                Some(Instant::now())
+            } else {
+                None
+            };
             scan_cell(view, qv16, node.offset, node.count, topk);
+            if let Some(start) = leaf_start {
+                trace.add_leaf_scan_us(start.elapsed().as_micros() as u64, node.count);
+            }
             trace.add_branch_scan(node.count);
             continue;
         }
@@ -596,8 +668,10 @@ fn traverse_candidates_best_first<T: SearchTraceSink>(
                 lower_bound: left_lb,
             });
             if overflow {
+                trace.inc_node_queue_overflows();
                 break;
             }
+            trace.observe_node_queue_len(queue.len());
         } else {
             trace.inc_pruned_nodes();
         }
@@ -610,12 +684,18 @@ fn traverse_candidates_best_first<T: SearchTraceSink>(
                 node_idx: node.right,
                 lower_bound: right_lb,
             });
+            if overflow {
+                trace.inc_node_queue_overflows();
+            } else {
+                trace.observe_node_queue_len(queue.len());
+            }
         } else {
             trace.inc_pruned_nodes();
         }
     }
 
     if overflow {
+        trace.inc_dfs_fallbacks();
         for candidate in candidates {
             if candidate.key < topk.worst_key() {
                 traverse_tree_with_lb(
@@ -672,7 +752,15 @@ fn traverse_tree_with_lb<T: SearchTraceSink>(
         trace.inc_nodes_visited();
         if node.is_leaf() {
             trace.inc_leaves_scanned();
+            let leaf_start = if trace.enabled() {
+                Some(Instant::now())
+            } else {
+                None
+            };
             scan_cell(view, qv16, node.offset, node.count, topk);
+            if let Some(start) = leaf_start {
+                trace.add_leaf_scan_us(start.elapsed().as_micros() as u64, node.count);
+            }
             trace.add_branch_scan(node.count);
             continue;
         }

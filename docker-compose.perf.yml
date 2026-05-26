@@ -1,7 +1,14 @@
 services:
-  nginx:
-    volumes:
-      - ./nginx.perf.conf:/etc/nginx/nginx.conf:ro
+  lb:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: rinha-2026-perf:local
+    environment:
+      - LB_TRACE=1
+      - LB_TRACE_EVERY=${LB_TRACE_EVERY:-10000}
+      - LB_TRACE_SLOW_US=${LB_TRACE_SLOW_US:-1000}
+      - LB_TRACE_SAMPLE=${LB_TRACE_SAMPLE:-0}
 
   api1:
     build:

@@ -1,4 +1,4 @@
-use lb::{run, LbConfig, Metrics};
+use lb::{run, LbConfig, Metrics, UpstreamProtocol};
 use std::net::SocketAddr;
 
 #[global_allocator]
@@ -31,6 +31,23 @@ fn main() {
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(10_000)
         .max(1);
+    let trace_slow_us = std::env::var("LB_TRACE_SLOW_US")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(10_000);
+    let trace_sample = std::env::var("LB_TRACE_SAMPLE")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    let upstream_protocol = match std::env::var("UPSTREAM_PROTOCOL")
+        .unwrap_or_else(|_| "http".to_string())
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "http" => UpstreamProtocol::Http,
+        "raw" => UpstreamProtocol::Raw,
+        other => panic!("invalid UPSTREAM_PROTOCOL: {other}"),
+    };
     let upstream_pool_per_backend = std::env::var("UPSTREAM_POOL_PER_BACKEND")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
@@ -45,23 +62,28 @@ fn main() {
     let config = LbConfig {
         listen,
         backends: [backend0, backend1],
+        upstream_protocol,
         upstream_pool_per_backend,
         upstream_preconnect_per_backend,
         metrics: if trace {
-            Some(Metrics::new(trace_every))
+            Some(Metrics::new(trace_every, trace_slow_us, trace_sample))
         } else {
             None
         },
     };
 
     eprintln!(
-        "LB listening on {}; backends={},{}; upstream_pool_per_backend={}; upstream_preconnect_per_backend={}; trace={}",
+        "LB listening on {}; backends={},{}; upstream_protocol={:?}; upstream_pool_per_backend={}; upstream_preconnect_per_backend={}; trace={}; trace_every={}; trace_slow_us={}; trace_sample={}",
         config.listen,
         config.backends[0],
         config.backends[1],
+        config.upstream_protocol,
         config.upstream_pool_per_backend,
         config.upstream_preconnect_per_backend,
-        trace
+        trace,
+        trace_every,
+        trace_slow_us,
+        trace_sample
     );
 
     let runtime = tokio::runtime::Builder::new_current_thread()

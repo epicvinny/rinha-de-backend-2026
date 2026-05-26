@@ -130,9 +130,18 @@ impl PerfCollector {
                 "response_build": stats(records.iter().map(|r| r.response_build_us).collect()),
                 "vectorize": stats(records.iter().map(|r| r.search.vectorize_us).collect()),
                 "home_scan": stats(records.iter().map(|r| r.search.home_scan_us).collect()),
+                "home_tree": stats(records.iter().map(|r| r.search.home_tree_us).collect()),
+                "root_filter": stats(records.iter().map(|r| r.search.root_filter_us).collect()),
+                "node_best_first": stats(records.iter().map(|r| r.search.node_best_first_us).collect()),
+                "leaf_scan": stats(records.iter().map(|r| r.search.leaf_scan_us).collect()),
                 "neighbor_seed": stats(records.iter().map(|r| r.search.neighbor_seed_us).collect()),
                 "branch_bound": stats(records.iter().map(|r| r.search.branch_bound_us).collect()),
                 "label_score": stats(records.iter().map(|r| r.search.label_score_us).collect()),
+            },
+            "request_counters": {
+                "body_len": stats(records.iter().map(|r| r.body_len as u64).collect()),
+                "score_bucket": stats(records.iter().map(|r| r.score_bucket as u64).collect()),
+                "in_flight_at_start": stats(records.iter().map(|r| r.in_flight_at_start).collect()),
             },
             "search_counters": {
                 "home_cell_count": stats(records.iter().map(|r| r.search.home_cell_count).collect()),
@@ -144,6 +153,12 @@ impl PerfCollector {
                 "nodes_visited": stats(records.iter().map(|r| r.search.nodes_visited).collect()),
                 "leaves_scanned": stats(records.iter().map(|r| r.search.leaves_scanned).collect()),
                 "pruned_nodes": stats(records.iter().map(|r| r.search.pruned_nodes).collect()),
+                "root_candidates": stats(records.iter().map(|r| r.search.root_candidates).collect()),
+                "root_cell_pruned": stats(records.iter().map(|r| r.search.root_cell_pruned).collect()),
+                "root_bbox_pruned": stats(records.iter().map(|r| r.search.root_bbox_pruned).collect()),
+                "node_queue_max_len": stats(records.iter().map(|r| r.search.node_queue_max_len).collect()),
+                "node_queue_overflows": stats(records.iter().map(|r| r.search.node_queue_overflows).collect()),
+                "dfs_fallbacks": stats(records.iter().map(|r| r.search.dfs_fallbacks).collect()),
             },
         });
 
@@ -177,6 +192,10 @@ impl Drop for RequestGuard<'_> {
 pub struct SearchTrace {
     pub vectorize_us: u64,
     pub home_scan_us: u64,
+    pub home_tree_us: u64,
+    pub root_filter_us: u64,
+    pub node_best_first_us: u64,
+    pub leaf_scan_us: u64,
     pub neighbor_seed_us: u64,
     pub branch_bound_us: u64,
     pub label_score_us: u64,
@@ -190,6 +209,12 @@ pub struct SearchTrace {
     pub nodes_visited: u64,
     pub leaves_scanned: u64,
     pub pruned_nodes: u64,
+    pub root_candidates: u64,
+    pub root_cell_pruned: u64,
+    pub root_bbox_pruned: u64,
+    pub node_queue_max_len: u64,
+    pub node_queue_overflows: u64,
+    pub dfs_fallbacks: u64,
     pub worst_topk_dist: i64,
     pub topk_distances: [i64; 5],
     pub stop_reason: &'static str,
@@ -229,6 +254,21 @@ impl SearchTraceSink for SearchTrace {
     }
 
     #[inline]
+    fn record_home_tree_us(&mut self, value: u64) {
+        self.home_tree_us += value;
+    }
+
+    #[inline]
+    fn record_root_filter_us(&mut self, value: u64) {
+        self.root_filter_us += value;
+    }
+
+    #[inline]
+    fn record_node_best_first_us(&mut self, value: u64) {
+        self.node_best_first_us += value;
+    }
+
+    #[inline]
     fn record_label_score_us(&mut self, value: u64) {
         self.label_score_us += value;
     }
@@ -255,6 +295,11 @@ impl SearchTraceSink for SearchTrace {
     fn add_branch_scan(&mut self, vectors: u32) {
         self.scanned_vectors += vectors as u64;
         self.scanned_cells += 1;
+    }
+
+    #[inline]
+    fn add_leaf_scan_us(&mut self, value: u64, _vectors: u32) {
+        self.leaf_scan_us += value;
     }
 
     #[inline]
@@ -286,6 +331,36 @@ impl SearchTraceSink for SearchTrace {
     fn inc_pruned_nodes(&mut self) {
         self.pruned_nodes += 1;
     }
+
+    #[inline]
+    fn inc_root_candidates(&mut self) {
+        self.root_candidates += 1;
+    }
+
+    #[inline]
+    fn inc_root_cell_pruned(&mut self) {
+        self.root_cell_pruned += 1;
+    }
+
+    #[inline]
+    fn inc_root_bbox_pruned(&mut self) {
+        self.root_bbox_pruned += 1;
+    }
+
+    #[inline]
+    fn observe_node_queue_len(&mut self, value: usize) {
+        self.node_queue_max_len = self.node_queue_max_len.max(value as u64);
+    }
+
+    #[inline]
+    fn inc_node_queue_overflows(&mut self) {
+        self.node_queue_overflows += 1;
+    }
+
+    #[inline]
+    fn inc_dfs_fallbacks(&mut self) {
+        self.dfs_fallbacks += 1;
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -293,6 +368,8 @@ pub struct RequestPerf {
     pub request_id: u64,
     pub in_flight_at_start: u64,
     pub max_in_flight_seen: u64,
+    pub body_len: usize,
+    pub score_bucket: u8,
     pub handler_total_us: u64,
     pub json_parse_us: u64,
     pub search_total_us: u64,
@@ -307,6 +384,8 @@ impl RequestPerf {
             "request_id": self.request_id,
             "query_key": self.search.query_key,
             "stop_reason": self.search.stop_reason,
+            "body_len": self.body_len,
+            "score_bucket": self.score_bucket,
             "in_flight_at_start": self.in_flight_at_start,
             "max_in_flight_seen": self.max_in_flight_seen,
             "timings_us": {
@@ -316,6 +395,10 @@ impl RequestPerf {
                 "response_build": self.response_build_us,
                 "vectorize": self.search.vectorize_us,
                 "home_scan": self.search.home_scan_us,
+                "home_tree": self.search.home_tree_us,
+                "root_filter": self.search.root_filter_us,
+                "node_best_first": self.search.node_best_first_us,
+                "leaf_scan": self.search.leaf_scan_us,
                 "neighbor_seed": self.search.neighbor_seed_us,
                 "branch_bound": self.search.branch_bound_us,
                 "label_score": self.search.label_score_us,
@@ -330,6 +413,12 @@ impl RequestPerf {
                 "nodes_visited": self.search.nodes_visited,
                 "leaves_scanned": self.search.leaves_scanned,
                 "pruned_nodes": self.search.pruned_nodes,
+                "root_candidates": self.search.root_candidates,
+                "root_cell_pruned": self.search.root_cell_pruned,
+                "root_bbox_pruned": self.search.root_bbox_pruned,
+                "node_queue_max_len": self.search.node_queue_max_len,
+                "node_queue_overflows": self.search.node_queue_overflows,
+                "dfs_fallbacks": self.search.dfs_fallbacks,
             },
             "topk": {
                 "worst_dist_sq": self.search.worst_topk_dist,

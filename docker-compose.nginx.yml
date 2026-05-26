@@ -1,0 +1,7 @@
+services:
+  lb:
+    image: nginx:alpine
+    command: ["nginx", "-g", "daemon off;"]
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    environment: []
