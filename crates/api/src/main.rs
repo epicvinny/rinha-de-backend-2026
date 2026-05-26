@@ -26,9 +26,30 @@ use search::Index;
 #[derive(Clone)]
 struct AppState {
     index: Arc<Index>,
+    constants: Arc<shared::Constants>,
     ready: Arc<AtomicBool>,
     perf: Option<Arc<perf::PerfCollector>>,
     log_search_avg: bool,
+    parser: ApiParser,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ApiParser {
+    Serde,
+    Fast,
+}
+
+impl ApiParser {
+    fn from_env() -> Self {
+        match std::env::var("API_PARSER")
+            .unwrap_or_else(|_| "serde".to_string())
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "fast" => ApiParser::Fast,
+            _ => ApiParser::Serde,
+        }
+    }
 }
 
 static REQ_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -90,14 +111,32 @@ fn score_body(
         let request = perf.begin_request();
 
         let parse_start = Instant::now();
-        let payload: shared::types::Payload<'_> =
-            serde_json::from_slice(body_bytes).map_err(|_e| StatusCode::BAD_REQUEST)?;
+        let fast_parsed = if state.parser == ApiParser::Fast {
+            shared::parse_payload_to_i16_and_key(body_bytes, &state.constants)
+        } else {
+            None
+        };
+        let payload;
+        let parsed_payload = if fast_parsed.is_none() {
+            payload = serde_json::from_slice::<shared::types::Payload<'_>>(body_bytes)
+                .map_err(|_e| StatusCode::BAD_REQUEST)?;
+            Some(&payload)
+        } else {
+            None
+        };
         let json_parse_us = perf::elapsed_us(parse_start);
 
         let mut search_trace = perf::SearchTrace::default();
         let search_start = Instant::now();
-        let (_approved, fraud_score_val) =
-            state.index.search_with_trace(&payload, &mut search_trace);
+        let (_approved, fraud_score_val) = if let Some((qv16, query_key)) = fast_parsed {
+            state
+                .index
+                .search_vector_with_trace(&qv16, query_key, &mut search_trace)
+        } else {
+            state
+                .index
+                .search_with_trace(parsed_payload.unwrap(), &mut search_trace)
+        };
         let search_total_us = perf::elapsed_us(search_start);
 
         let response_start = Instant::now();
@@ -124,9 +163,21 @@ fn score_body(
         return Ok(bucket);
     }
 
-    let payload: shared::types::Payload<'_> =
-        serde_json::from_slice(body_bytes).map_err(|_e| StatusCode::BAD_REQUEST)?;
-    let (_approved, fraud_score_val) = state.index.search(&payload);
+    let (_approved, fraud_score_val) = if state.parser == ApiParser::Fast {
+        if let Some((qv16, query_key)) =
+            shared::parse_payload_to_i16_and_key(body_bytes, &state.constants)
+        {
+            state.index.search_vector(&qv16, query_key)
+        } else {
+            let payload: shared::types::Payload<'_> =
+                serde_json::from_slice(body_bytes).map_err(|_e| StatusCode::BAD_REQUEST)?;
+            state.index.search(&payload)
+        }
+    } else {
+        let payload: shared::types::Payload<'_> =
+            serde_json::from_slice(body_bytes).map_err(|_e| StatusCode::BAD_REQUEST)?;
+        state.index.search(&payload)
+    };
 
     if state.log_search_avg {
         let elapsed = handler_start.elapsed().as_micros() as u64;
@@ -165,7 +216,7 @@ async fn run_raw_server(listen: String, state: AppState) -> io::Result<()> {
 
 async fn handle_raw_connection(mut stream: TcpStream, state: AppState) -> io::Result<()> {
     let mut len_buf = [0u8; 2];
-    let mut body = Vec::with_capacity(1024);
+    let mut body = [0u8; RAW_MAX_BODY_BYTES];
 
     loop {
         match stream.read_exact(&mut len_buf).await {
@@ -180,16 +231,15 @@ async fn handle_raw_connection(mut stream: TcpStream, state: AppState) -> io::Re
             return Ok(());
         }
 
-        body.resize(body_len, 0);
-        stream.read_exact(&mut body).await?;
+        let body_slice = &mut body[..body_len];
+        stream.read_exact(body_slice).await?;
 
         let handler_start = Instant::now();
-        let bucket = match score_body(&state, &body, handler_start, false) {
+        let bucket = match score_body(&state, body_slice, handler_start, false) {
             Ok(bucket) => bucket,
             Err(_) => RAW_BAD_REQUEST,
         };
         stream.write_all(&[bucket]).await?;
-        body.clear();
     }
 }
 
@@ -222,6 +272,8 @@ fn main() {
         Arc::new(perf::PerfCollector::new(config))
     });
     let log_search_avg = std::env::var("LOG_SEARCH_AVG").ok().as_deref() == Some("1");
+    let parser = ApiParser::from_env();
+    eprintln!("API parser: {:?}", parser);
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -248,6 +300,7 @@ fn main() {
         }
 
         let index = Arc::new(Index::new(mmap));
+        let constants = Arc::new(shared::Constants::load_embedded());
         let ready = Arc::new(AtomicBool::new(false));
 
         // Warmup in background
@@ -262,9 +315,11 @@ fn main() {
 
         let state = AppState {
             index,
+            constants,
             ready,
             perf,
             log_search_avg,
+            parser,
         };
 
         if let Some(raw_listen) = raw_listen {

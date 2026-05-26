@@ -810,6 +810,65 @@ struct RequestHead {
 }
 
 fn parse_request_head(header: &[u8]) -> Result<RequestHead, ClientReadError> {
+    if let Some(head) = parse_request_head_fast(header)? {
+        return Ok(head);
+    }
+    parse_request_head_generic(header)
+}
+
+fn parse_request_head_fast(header: &[u8]) -> Result<Option<RequestHead>, ClientReadError> {
+    const POST_FRAUD_11: &[u8] = b"POST /fraud-score HTTP/1.1\r\n";
+    const POST_FRAUD_10: &[u8] = b"POST /fraud-score HTTP/1.0\r\n";
+    const GET_READY_11: &[u8] = b"GET /ready HTTP/1.1\r\n";
+    const GET_READY_10: &[u8] = b"GET /ready HTTP/1.0\r\n";
+
+    let (route, http10) = if header.starts_with(POST_FRAUD_11) {
+        (Route::FraudScore, false)
+    } else if header.starts_with(POST_FRAUD_10) {
+        (Route::FraudScore, true)
+    } else if header.starts_with(GET_READY_11) {
+        (Route::Ready, false)
+    } else if header.starts_with(GET_READY_10) {
+        (Route::Ready, true)
+    } else {
+        return Ok(None);
+    };
+
+    if find_subslice(header, b"\r\nTransfer-Encoding:")
+        .or_else(|| find_subslice(header, b"\r\ntransfer-encoding:"))
+        .is_some()
+    {
+        return Ok(None);
+    }
+
+    let content_length = if route == Route::FraudScore {
+        let Some(value_start) = find_content_length_value(header) else {
+            return Ok(None);
+        };
+        parse_usize_decimal_header(header, value_start)?
+    } else {
+        0
+    };
+
+    if route == Route::FraudScore && content_length == 0 {
+        return Err(ClientReadError {
+            response: BAD_REQUEST,
+        });
+    }
+    if content_length > MAX_BODY_BYTES {
+        return Err(ClientReadError {
+            response: PAYLOAD_TOO_LARGE,
+        });
+    }
+
+    Ok(Some(RequestHead {
+        route,
+        content_length,
+        close_after_response: http10 || contains_connection_close_fast(header),
+    }))
+}
+
+fn parse_request_head_generic(header: &[u8]) -> Result<RequestHead, ClientReadError> {
     let header_str = std::str::from_utf8(header).map_err(|_| ClientReadError {
         response: BAD_REQUEST,
     })?;
@@ -901,6 +960,66 @@ fn parse_request_head(header: &[u8]) -> Result<RequestHead, ClientReadError> {
         content_length,
         close_after_response,
     })
+}
+
+fn find_content_length_value(header: &[u8]) -> Option<usize> {
+    find_subslice(header, b"\r\nContent-Length:")
+        .or_else(|| find_subslice(header, b"\r\ncontent-length:"))
+        .map(|idx| {
+            let mut pos = idx + b"\r\nContent-Length:".len();
+            while header.get(pos) == Some(&b' ') || header.get(pos) == Some(&b'\t') {
+                pos += 1;
+            }
+            pos
+        })
+}
+
+fn parse_usize_decimal_header(header: &[u8], mut pos: usize) -> Result<usize, ClientReadError> {
+    let mut value = 0usize;
+    let mut found = false;
+    while let Some(&byte) = header.get(pos) {
+        match byte {
+            b'0'..=b'9' => {
+                found = true;
+                value = value
+                    .checked_mul(10)
+                    .and_then(|v| v.checked_add((byte - b'0') as usize))
+                    .ok_or(ClientReadError {
+                        response: BAD_REQUEST,
+                    })?;
+            }
+            b'\r' | b'\n' => break,
+            b' ' | b'\t' if !found => {}
+            _ => {
+                return Err(ClientReadError {
+                    response: BAD_REQUEST,
+                })
+            }
+        }
+        pos += 1;
+    }
+    if found {
+        Ok(value)
+    } else {
+        Err(ClientReadError {
+            response: BAD_REQUEST,
+        })
+    }
+}
+
+fn contains_connection_close_fast(header: &[u8]) -> bool {
+    find_subslice(header, b"\r\nConnection: close")
+        .or_else(|| find_subslice(header, b"\r\nconnection: close"))
+        .is_some()
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 fn parse_response_content_length(header: &[u8]) -> io::Result<usize> {

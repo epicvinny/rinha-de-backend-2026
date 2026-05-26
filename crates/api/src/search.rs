@@ -274,6 +274,11 @@ impl Index {
         self.search_inner(payload, &mut trace)
     }
 
+    pub fn search_vector(&self, qv16: &[i16; 16], query_key: u16) -> (bool, f64) {
+        let mut trace = NoopTrace;
+        self.search_precomputed(qv16, query_key, &mut trace)
+    }
+
     pub fn search_with_trace<T: SearchTraceSink>(
         &self,
         payload: &Payload<'_>,
@@ -282,12 +287,20 @@ impl Index {
         self.search_inner(payload, trace)
     }
 
+    pub fn search_vector_with_trace<T: SearchTraceSink>(
+        &self,
+        qv16: &[i16; 16],
+        query_key: u16,
+        trace: &mut T,
+    ) -> (bool, f64) {
+        self.search_precomputed(qv16, query_key, trace)
+    }
+
     fn search_inner<T: SearchTraceSink>(
         &self,
         payload: &Payload<'_>,
         trace: &mut T,
     ) -> (bool, f64) {
-        let view = self.view();
         let vectorize_start = if trace.enabled() {
             Some(Instant::now())
         } else {
@@ -299,11 +312,21 @@ impl Index {
         }
         trace.set_query_key(query_key);
 
+        self.search_precomputed(&qv16, query_key, trace)
+    }
+
+    fn search_precomputed<T: SearchTraceSink>(
+        &self,
+        qv16: &[i16; 16],
+        query_key: u16,
+        trace: &mut T,
+    ) -> (bool, f64) {
+        let view = self.view();
         let mut topk = TopK::new();
 
         match self.engine {
-            SearchEngine::Cell => search_cell(&view, &qv16, query_key, &mut topk, trace),
-            SearchEngine::Tree => search_tree(&view, &qv16, query_key, &mut topk, trace),
+            SearchEngine::Cell => search_cell(&view, qv16, query_key, &mut topk, trace),
+            SearchEngine::Tree => search_tree(&view, qv16, query_key, &mut topk, trace),
         }
 
         // Count fraud among top-5 directly from the TopK entries.

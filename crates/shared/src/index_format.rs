@@ -6,7 +6,7 @@ pub const VERSION: u32 = 4;
 pub const N_DIM_TOTAL: u32 = 14;
 pub const N_DIM_PADDED: u32 = 16;
 pub const N_CELLS: usize = 8192;
-pub const TREE_LEAF_SIZE: usize = 128;
+pub const TREE_LEAF_SIZE: usize = 192;
 pub const EMPTY_NODE: u32 = u32::MAX;
 
 #[repr(C)]
