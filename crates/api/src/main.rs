@@ -29,8 +29,10 @@ use tokio::net::{TcpListener, TcpStream};
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+mod classifier;
 mod perf;
 mod search;
+mod tree_model;
 use search::Index;
 
 #[derive(Clone)]
@@ -41,6 +43,7 @@ struct AppState {
     perf: Option<Arc<perf::PerfCollector>>,
     log_search_avg: bool,
     parser: ApiParser,
+    classifier: ApiClassifier,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,6 +61,25 @@ impl ApiParser {
         {
             "fast" => ApiParser::Fast,
             _ => ApiParser::Serde,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ApiClassifier {
+    Off,
+    Tree,
+}
+
+impl ApiClassifier {
+    fn from_env() -> Self {
+        match std::env::var("API_CLASSIFIER")
+            .unwrap_or_else(|_| "off".to_string())
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "tree" => ApiClassifier::Tree,
+            _ => ApiClassifier::Off,
         }
     }
 }
@@ -250,6 +272,12 @@ fn score_body(
 }
 
 fn score_body_fast_bucket(state: &AppState, body_bytes: &[u8]) -> Result<u8, StatusCode> {
+    if state.classifier == ApiClassifier::Tree {
+        if let Some(approved) = classifier::classify_approved(body_bytes) {
+            return Ok(if approved { 0 } else { 5 });
+        }
+    }
+
     if let Some((qv16, query_key)) =
         shared::parse_payload_to_i16_and_key(body_bytes, &state.constants)
     {
@@ -841,6 +869,8 @@ fn main() {
     let log_search_avg = std::env::var("LOG_SEARCH_AVG").ok().as_deref() == Some("1");
     let parser = ApiParser::from_env();
     eprintln!("API parser: {:?}", parser);
+    let classifier = ApiClassifier::from_env();
+    eprintln!("API classifier: {:?}", classifier);
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -887,6 +917,7 @@ fn main() {
             perf,
             log_search_avg,
             parser,
+            classifier,
         };
 
         if let Some(raw_listen) = raw_listen {
