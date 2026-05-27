@@ -391,6 +391,39 @@ fn run_fd_handoff_server(listen: String, state: AppState) -> io::Result<()> {
 }
 
 #[cfg(unix)]
+fn run_minimal_ready_server(port: u16, ready: Arc<AtomicBool>) -> io::Result<()> {
+    let listener = std::net::TcpListener::bind(format!("0.0.0.0:{}", port))?;
+    eprintln!("Minimal ready server listening on port {}", port);
+    let mut buf = [0u8; 512];
+
+    for stream in listener.incoming() {
+        let mut stream = stream?;
+        let read = match stream.read(&mut buf) {
+            Ok(read) => read,
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        };
+        let request = &buf[..read];
+        let response: &[u8] = if request.starts_with(b"GET /ready ")
+            || request.starts_with(b"HEAD /ready ")
+        {
+            if ready.load(Ordering::Relaxed) {
+                HTTP_READY_OK
+            } else {
+                b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            }
+        } else if request.starts_with(b"GET ") || request.starts_with(b"HEAD ") {
+            HTTP_NOT_FOUND
+        } else {
+            HTTP_METHOD_NOT_ALLOWED
+        };
+        let _ = stream.write_all(response);
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
 fn handle_fd_control_connection(control: UnixStream, state: AppState) -> io::Result<()> {
     loop {
         let Some(fd) = recv_fd_blocking(&control)? else {
@@ -889,6 +922,40 @@ fn main() {
     eprintln!("API parser: {:?}", parser);
     let classifier = ApiClassifier::from_env();
     eprintln!("API classifier: {:?}", classifier);
+
+    #[cfg(unix)]
+    if classifier == ApiClassifier::TreeOnly
+        && raw_listen.is_none()
+        && fd_listen.is_some()
+        && perf.is_none()
+        && !log_search_avg
+    {
+        let ready = Arc::new(AtomicBool::new(true));
+        let state = AppState {
+            index: None,
+            constants: Arc::new(shared::Constants::load_embedded()),
+            ready: Arc::clone(&ready),
+            perf,
+            log_search_avg,
+            parser,
+            classifier,
+        };
+        let ready_thread = Arc::clone(&ready);
+        thread::Builder::new()
+            .name("ready-http".to_string())
+            .stack_size(64 * 1024)
+            .spawn(move || {
+                if let Err(err) = run_minimal_ready_server(port, ready_thread) {
+                    eprintln!("minimal ready server exited with error: {}", err);
+                }
+            })
+            .expect("failed to spawn minimal ready server");
+
+        eprintln!("Classifier-only handoff API ready on port {}", port);
+        run_fd_handoff_server(fd_listen.unwrap(), state)
+            .expect("fd handoff server exited with error");
+        return;
+    }
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
