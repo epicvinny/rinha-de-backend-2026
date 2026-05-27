@@ -98,7 +98,7 @@ const HANDOFF_BUFFER_BYTES: usize = HANDOFF_MAX_HEADER_BYTES + RAW_MAX_BODY_BYTE
 #[cfg(unix)]
 const HANDOFF_CONTROL_STACK_BYTES: usize = 64 * 1024;
 #[cfg(unix)]
-const HANDOFF_CLIENT_STACK_BYTES: usize = 256 * 1024;
+const HANDOFF_CLIENT_STACK_BYTES: usize = 96 * 1024;
 
 #[cfg(unix)]
 const HTTP_BAD_REQUEST: &[u8] =
