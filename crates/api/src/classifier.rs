@@ -101,67 +101,26 @@ fn score_tree_body(body: &[u8]) -> Option<bool> {
 fn parse_fast_fields(body: &[u8]) -> Option<FastFields<'_>> {
     let mut pos = 0usize;
 
-    pos = find_after(body, b"\"transaction\":{\"amount\":", pos)?;
-    let (amount, next) = parse_number_at(body, pos)?;
-    pos = next;
+    let amount = parse_number_field_from(body, &mut pos, b"\"amount\"")?;
+    let installments = parse_number_field_from(body, &mut pos, b"\"installments\"")?;
+    let requested_at = parse_string_field_from(body, &mut pos, b"\"requested_at\"")?;
+    let customer_avg = parse_number_field_from(body, &mut pos, b"\"avg_amount\"")?;
+    let tx_count_24h = parse_number_field_from(body, &mut pos, b"\"tx_count_24h\"")?;
+    let known_merchants = parse_array_field_from(body, &mut pos, b"\"known_merchants\"")?;
+    let merchant_id = parse_string_field_from(body, &mut pos, b"\"id\"")?;
+    let merchant_mcc = parse_string_field_from(body, &mut pos, b"\"mcc\"")?;
+    let merchant_avg = parse_number_field_from(body, &mut pos, b"\"avg_amount\"")?;
+    let is_online = parse_bool_field_from(body, &mut pos, b"\"is_online\"")?;
+    let card_present = parse_bool_field_from(body, &mut pos, b"\"card_present\"")?;
+    let km_from_home = parse_number_field_from(body, &mut pos, b"\"km_from_home\"")?;
 
-    pos = expect_after(body, b",\"installments\":", pos)?;
-    let (installments, next) = parse_number_at(body, pos)?;
-    pos = next;
-
-    pos = expect_after(body, b",\"requested_at\":", pos)?;
-    let (requested_at, next) = parse_string_at(body, pos)?;
-    pos = next;
-
-    pos = expect_after(body, b"},\"customer\":{\"avg_amount\":", pos)?;
-    let (customer_avg, next) = parse_number_at(body, pos)?;
-    pos = next;
-
-    pos = expect_after(body, b",\"tx_count_24h\":", pos)?;
-    let (tx_count_24h, next) = parse_number_at(body, pos)?;
-    pos = next;
-
-    pos = expect_after(body, b",\"known_merchants\":", pos)?;
-    let (known_merchants, next) = parse_array_at(body, pos)?;
-    pos = next;
-
-    pos = expect_after(body, b"},\"merchant\":{\"id\":", pos)?;
-    let (merchant_id, next) = parse_string_at(body, pos)?;
-    pos = next;
-
-    pos = expect_after(body, b",\"mcc\":", pos)?;
-    let (merchant_mcc, next) = parse_string_at(body, pos)?;
-    pos = next;
-
-    pos = expect_after(body, b",\"avg_amount\":", pos)?;
-    let (merchant_avg, next) = parse_number_at(body, pos)?;
-    pos = next;
-
-    pos = expect_after(body, b"},\"terminal\":{\"is_online\":", pos)?;
-    let (is_online, next) = parse_bool_at(body, pos)?;
-    pos = next;
-
-    pos = expect_after(body, b",\"card_present\":", pos)?;
-    let (card_present, next) = parse_bool_at(body, pos)?;
-    pos = next;
-
-    pos = expect_after(body, b",\"km_from_home\":", pos)?;
-    let (km_from_home, next) = parse_number_at(body, pos)?;
-    pos = next;
-
-    let last_value_pos = expect_after(body, b"},\"last_transaction\":", pos)?;
+    let last_value_pos = value_start_for_field(body, pos, b"\"last_transaction\"")?;
     let mut last_timestamp = None;
     let mut km_from_current = -1.0f32;
     if !body.get(last_value_pos..)?.starts_with(b"null") {
         pos = last_value_pos;
-        pos = expect_after(body, b"{\"timestamp\":", pos)?;
-        let (timestamp, next) = parse_string_at(body, pos)?;
-        last_timestamp = Some(timestamp);
-        pos = next;
-
-        pos = expect_after(body, b",\"km_from_current\":", pos)?;
-        let (value, _) = parse_number_at(body, pos)?;
-        km_from_current = value;
+        last_timestamp = Some(parse_string_field_from(body, &mut pos, b"\"timestamp\"")?);
+        km_from_current = parse_number_field_from(body, &mut pos, b"\"km_from_current\"")?;
     }
 
     Some(FastFields {
@@ -180,6 +139,52 @@ fn parse_fast_fields(body: &[u8]) -> Option<FastFields<'_>> {
         last_timestamp,
         km_from_current,
     })
+}
+
+#[inline]
+fn parse_number_field_from(body: &[u8], pos: &mut usize, field: &[u8]) -> Option<f32> {
+    let value_pos = value_start_for_field(body, *pos, field)?;
+    let (value, next) = parse_number_at(body, value_pos)?;
+    *pos = next;
+    Some(value)
+}
+
+#[inline]
+fn parse_string_field_from<'a>(body: &'a [u8], pos: &mut usize, field: &[u8]) -> Option<&'a [u8]> {
+    let value_pos = value_start_for_field(body, *pos, field)?;
+    let (value, next) = parse_string_at(body, value_pos)?;
+    *pos = next;
+    Some(value)
+}
+
+#[inline]
+fn parse_array_field_from<'a>(body: &'a [u8], pos: &mut usize, field: &[u8]) -> Option<&'a [u8]> {
+    let value_pos = value_start_for_field(body, *pos, field)?;
+    let (value, next) = parse_array_at(body, value_pos)?;
+    *pos = next;
+    Some(value)
+}
+
+#[inline]
+fn parse_bool_field_from(body: &[u8], pos: &mut usize, field: &[u8]) -> Option<bool> {
+    let value_pos = value_start_for_field(body, *pos, field)?;
+    let (value, next) = parse_bool_at(body, value_pos)?;
+    *pos = next;
+    Some(value)
+}
+
+fn value_start_for_field(body: &[u8], start: usize, field: &[u8]) -> Option<usize> {
+    let field_rel = find_subslice(body.get(start..)?, field)?;
+    let after_field = start + field_rel + field.len();
+    let colon_rel = body
+        .get(after_field..)?
+        .iter()
+        .position(|&byte| byte == b':')?;
+    let mut i = after_field + colon_rel + 1;
+    while i < body.len() && is_json_whitespace(body[i]) {
+        i += 1;
+    }
+    Some(i)
 }
 
 fn parse_string_at(body: &[u8], value_pos: usize) -> Option<(&[u8], usize)> {
@@ -322,24 +327,19 @@ fn parse_iso_bytes(bytes: &[u8]) -> Option<shared::vectorize::FastDateTime> {
 }
 
 #[inline]
+fn is_json_whitespace(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\n' | b'\r' | b'\t')
+}
+
+#[inline]
 fn clamp01(x: f32) -> f32 {
     x.clamp(0.0, 1.0)
 }
 
-fn find_after(haystack: &[u8], needle: &[u8], start: usize) -> Option<usize> {
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
-        .get(start..)?
         .windows(needle.len())
         .position(|window| window == needle)
-        .map(|offset| start + offset + needle.len())
-}
-
-fn expect_after(haystack: &[u8], needle: &[u8], start: usize) -> Option<usize> {
-    if haystack.get(start..)?.starts_with(needle) {
-        Some(start + needle.len())
-    } else {
-        None
-    }
 }
 
 #[cfg(test)]
