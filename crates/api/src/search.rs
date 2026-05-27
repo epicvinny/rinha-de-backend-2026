@@ -1,10 +1,12 @@
 use memmap2::Mmap;
+use shared::cell::{DAY_Q, HOUR_Q};
 use shared::distance::l2sq_avx2;
 use shared::types::Payload;
 use shared::{
     cell_lower_bound_sq, neighbor_keys, round4, vectorize_to_i16_and_key, Constants, IndexView,
     TopK, TreeNode, EMPTY_NODE,
 };
+use std::sync::Arc;
 use std::time::Instant;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -31,6 +33,7 @@ pub struct Index {
     mmap: Mmap,
     constants: Constants,
     engine: SearchEngine,
+    time_orders: Arc<TimeOrders>,
 }
 
 unsafe impl Send for Index {}
@@ -40,6 +43,60 @@ unsafe impl Sync for Index {}
 // Smallest lower bound is always at the end (index len-1), allowing O(1) popping.
 // No heap allocation — stack-allocated arrays.
 const PQ_CAP: usize = 32;
+const PARTITION_MASK: u16 = 0x1F00;
+const CROSS_PARTITION_MIN_DIST: i32 = 100_000_000;
+const ROOT_CANDIDATE_CAP: usize = 2048;
+const TIME_CELL_COUNT: usize = 24 * 7;
+
+struct TimeOrders {
+    rows: [[u16; TIME_CELL_COUNT]; TIME_CELL_COUNT],
+}
+
+impl TimeOrders {
+    fn new() -> Self {
+        let mut rows = [[0u16; TIME_CELL_COUNT]; TIME_CELL_COUNT];
+        for q_idx in 0..TIME_CELL_COUNT {
+            let q_bits = time_bits_from_idx(q_idx);
+            let mut row = [0u16; TIME_CELL_COUNT];
+            for (idx, item) in row.iter_mut().enumerate() {
+                *item = time_bits_from_idx(idx);
+            }
+            row.sort_by_key(|&target_bits| time_lower_bound_sq(q_bits, target_bits));
+            rows[q_idx] = row;
+        }
+        Self { rows }
+    }
+
+    #[inline]
+    fn row(&self, query_key: u16) -> &[u16; TIME_CELL_COUNT] {
+        &self.rows[time_idx_from_key(query_key)]
+    }
+}
+
+#[inline]
+fn time_idx_from_key(key: u16) -> usize {
+    let hour = ((key >> 3) & 0x1F) as usize;
+    let day = (key & 0x7) as usize;
+    hour * 7 + day
+}
+
+#[inline]
+fn time_bits_from_idx(idx: usize) -> u16 {
+    let hour = idx / 7;
+    let day = idx % 7;
+    ((hour as u16) << 3) | day as u16
+}
+
+#[inline]
+fn time_lower_bound_sq(query_bits: u16, target_bits: u16) -> i32 {
+    let q_hour = ((query_bits >> 3) & 0x1F) as usize;
+    let t_hour = ((target_bits >> 3) & 0x1F) as usize;
+    let q_day = (query_bits & 0x7) as usize;
+    let t_day = (target_bits & 0x7) as usize;
+    let dh = HOUR_Q[q_hour] as i32 - HOUR_Q[t_hour] as i32;
+    let dd = DAY_Q[q_day] as i32 - DAY_Q[t_day] as i32;
+    dh * dh + dd * dd
+}
 
 pub trait SearchTraceSink {
     #[inline]
@@ -235,6 +292,7 @@ impl Index {
             mmap,
             constants,
             engine,
+            time_orders: Arc::new(TimeOrders::new()),
         }
     }
 
@@ -277,6 +335,26 @@ impl Index {
     pub fn search_vector(&self, qv16: &[i16; 16], query_key: u16) -> (bool, f64) {
         let mut trace = NoopTrace;
         self.search_precomputed(qv16, query_key, &mut trace)
+    }
+
+    pub fn search_bucket_vector(&self, qv16: &[i16; 16], query_key: u16) -> u8 {
+        let view = self.view();
+        let mut topk = TopK::new();
+        let mut trace = NoopTrace;
+
+        match self.engine {
+            SearchEngine::Cell => search_cell(&view, qv16, query_key, &mut topk, &mut trace),
+            SearchEngine::Tree => search_tree(
+                &view,
+                qv16,
+                query_key,
+                &self.time_orders,
+                &mut topk,
+                &mut trace,
+            ),
+        }
+
+        topk.fraud_count() as u8
     }
 
     pub fn search_with_trace<T: SearchTraceSink>(
@@ -326,7 +404,9 @@ impl Index {
 
         match self.engine {
             SearchEngine::Cell => search_cell(&view, qv16, query_key, &mut topk, trace),
-            SearchEngine::Tree => search_tree(&view, qv16, query_key, &mut topk, trace),
+            SearchEngine::Tree => {
+                search_tree(&view, qv16, query_key, &self.time_orders, &mut topk, trace)
+            }
         }
 
         // Count fraud among top-5 directly from the TopK entries.
@@ -435,6 +515,7 @@ fn search_tree<T: SearchTraceSink>(
     view: &IndexView<'_>,
     qv16: &[i16; 16],
     query_key: u16,
+    time_orders: &TimeOrders,
     topk: &mut TopK,
     trace: &mut T,
 ) {
@@ -458,48 +539,101 @@ fn search_tree<T: SearchTraceSink>(
         }
     }
 
+    let same_partition_only = topk.is_full() && topk.worst_dist_sq() < CROSS_PARTITION_MIN_DIST;
+    let query_partition = query_key & PARTITION_MASK;
+
     let mut candidates = [RootCandidate {
         key: u64::MAX,
         root_idx: EMPTY_NODE,
         lower_bound: i32::MAX,
-    }; 8192];
+    }; ROOT_CANDIDATE_CAP];
     let mut candidate_len = 0usize;
+    let mut candidate_overflow = false;
 
     let root_filter_start = if trace.enabled() {
         Some(Instant::now())
     } else {
         None
     };
-    for idx in 0..view.n_populated_tree_roots() {
-        let key = view.populated_tree_key_at(idx);
-        if key == query_key {
-            continue;
-        }
+    if same_partition_only {
+        let query_time_bits = query_key & !PARTITION_MASK;
+        for &time_bits in time_orders.row(query_key) {
+            let key = query_partition | time_bits;
+            if key == query_key {
+                continue;
+            }
+            let cell_lb = time_lower_bound_sq(query_time_bits, time_bits);
+            if topk.is_full() && cell_lb > topk.worst_dist_sq() {
+                break;
+            }
 
-        let root_entry = view.tree_root_entry(key);
-        if root_entry.root == EMPTY_NODE {
-            continue;
-        }
-        let root = view.tree_node(root_entry.root);
-        let cell_lb = cell_lower_bound_sq(qv16, query_key, key);
-        if !can_bound_improve(topk, cell_lb, root.min_original_id) {
-            trace.inc_pruned_nodes();
-            trace.inc_root_cell_pruned();
-            continue;
-        }
+            let root_entry = view.tree_root_entry(key);
+            if root_entry.root == EMPTY_NODE {
+                continue;
+            }
+            let root = view.tree_node(root_entry.root);
+            if !can_bound_improve(topk, cell_lb, root.min_original_id) {
+                trace.inc_pruned_nodes();
+                trace.inc_root_cell_pruned();
+                continue;
+            }
 
-        let lb = bbox_lower_bound_sq(qv16, root);
-        if can_bound_improve(topk, lb, root.min_original_id) {
-            candidates[candidate_len] = RootCandidate {
-                key: TopK::make_key(lb, root.min_original_id),
-                root_idx: root_entry.root,
-                lower_bound: lb,
-            };
-            candidate_len += 1;
-            trace.inc_root_candidates();
-        } else {
-            trace.inc_pruned_nodes();
-            trace.inc_root_bbox_pruned();
+            let lb = bbox_lower_bound_sq(qv16, root);
+            if can_bound_improve(topk, lb, root.min_original_id) {
+                if candidate_len == candidates.len() {
+                    candidate_overflow = true;
+                    trace.inc_node_queue_overflows();
+                    break;
+                }
+                candidates[candidate_len] = RootCandidate {
+                    key: TopK::make_key(lb, root.min_original_id),
+                    root_idx: root_entry.root,
+                    lower_bound: lb,
+                };
+                candidate_len += 1;
+                trace.inc_root_candidates();
+            } else {
+                trace.inc_pruned_nodes();
+                trace.inc_root_bbox_pruned();
+            }
+        }
+    } else {
+        for idx in 0..view.n_populated_tree_roots() {
+            let key = view.populated_tree_key_at(idx);
+            if key == query_key {
+                continue;
+            }
+
+            let root_entry = view.tree_root_entry(key);
+            if root_entry.root == EMPTY_NODE {
+                continue;
+            }
+            let root = view.tree_node(root_entry.root);
+            let cell_lb = cell_lower_bound_sq(qv16, query_key, key);
+            if !can_bound_improve(topk, cell_lb, root.min_original_id) {
+                trace.inc_pruned_nodes();
+                trace.inc_root_cell_pruned();
+                continue;
+            }
+
+            let lb = bbox_lower_bound_sq(qv16, root);
+            if can_bound_improve(topk, lb, root.min_original_id) {
+                if candidate_len == candidates.len() {
+                    candidate_overflow = true;
+                    trace.inc_node_queue_overflows();
+                    break;
+                }
+                candidates[candidate_len] = RootCandidate {
+                    key: TopK::make_key(lb, root.min_original_id),
+                    root_idx: root_entry.root,
+                    lower_bound: lb,
+                };
+                candidate_len += 1;
+                trace.inc_root_candidates();
+            } else {
+                trace.inc_pruned_nodes();
+                trace.inc_root_bbox_pruned();
+            }
         }
     }
     if let Some(start) = root_filter_start {
@@ -511,7 +645,12 @@ fn search_tree<T: SearchTraceSink>(
     } else {
         None
     };
-    traverse_candidates_best_first(view, qv16, &candidates[..candidate_len], topk, trace);
+    if candidate_overflow {
+        trace.inc_dfs_fallbacks();
+        traverse_all_roots_dfs(view, qv16, query_key, topk, trace);
+    } else {
+        traverse_candidates_best_first(view, qv16, &candidates[..candidate_len], topk, trace);
+    }
     if let Some(start) = node_best_first_start {
         trace.record_node_best_first_us(start.elapsed().as_micros() as u64);
     }
@@ -730,6 +869,40 @@ fn traverse_candidates_best_first<T: SearchTraceSink>(
                     trace,
                 );
             }
+        }
+    }
+}
+
+fn traverse_all_roots_dfs<T: SearchTraceSink>(
+    view: &IndexView<'_>,
+    qv16: &[i16; 16],
+    query_key: u16,
+    topk: &mut TopK,
+    trace: &mut T,
+) {
+    for idx in 0..view.n_populated_tree_roots() {
+        let key = view.populated_tree_key_at(idx);
+        if key == query_key {
+            continue;
+        }
+
+        let root_entry = view.tree_root_entry(key);
+        if root_entry.root == EMPTY_NODE {
+            continue;
+        }
+
+        let root = view.tree_node(root_entry.root);
+        let cell_lb = cell_lower_bound_sq(qv16, query_key, key);
+        if !can_bound_improve(topk, cell_lb, root.min_original_id) {
+            trace.inc_pruned_nodes();
+            continue;
+        }
+
+        let lb = bbox_lower_bound_sq(qv16, root);
+        if can_bound_improve(topk, lb, root.min_original_id) {
+            traverse_tree_with_lb(view, qv16, root_entry.root, lb, topk, trace);
+        } else {
+            trace.inc_pruned_nodes();
         }
     }
 }

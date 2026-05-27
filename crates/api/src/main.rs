@@ -74,7 +74,7 @@ const HANDOFF_BUFFER_BYTES: usize = HANDOFF_MAX_HEADER_BYTES + RAW_MAX_BODY_BYTE
 #[cfg(unix)]
 const HANDOFF_CONTROL_STACK_BYTES: usize = 64 * 1024;
 #[cfg(unix)]
-const HANDOFF_CLIENT_STACK_BYTES: usize = 1024 * 1024;
+const HANDOFF_CLIENT_STACK_BYTES: usize = 256 * 1024;
 
 #[cfg(unix)]
 const HTTP_BAD_REQUEST: &[u8] =
@@ -249,6 +249,19 @@ fn score_body(
     Ok(score_bucket_for_fraud_score(fraud_score_val))
 }
 
+fn score_body_fast_bucket(state: &AppState, body_bytes: &[u8]) -> Result<u8, StatusCode> {
+    if let Some((qv16, query_key)) =
+        shared::parse_payload_to_i16_and_key(body_bytes, &state.constants)
+    {
+        return Ok(state.index.search_bucket_vector(&qv16, query_key));
+    }
+
+    let payload: shared::types::Payload<'_> =
+        serde_json::from_slice(body_bytes).map_err(|_e| StatusCode::BAD_REQUEST)?;
+    let (_approved, fraud_score_val) = state.index.search(&payload);
+    Ok(score_bucket_for_fraud_score(fraud_score_val))
+}
+
 async fn run_raw_server(listen: String, state: AppState) -> io::Result<()> {
     let listener = TcpListener::bind(&listen).await?;
     eprintln!("Raw fraud-score server listening on {}", listen);
@@ -292,7 +305,13 @@ async fn handle_raw_connection(mut stream: TcpStream, state: AppState) -> io::Re
         } else {
             None
         };
-        let bucket = match score_body(&state, body_slice, handler_start, false) {
+        let bucket_result =
+            if state.perf.is_none() && !state.log_search_avg && state.parser == ApiParser::Fast {
+                score_body_fast_bucket(&state, body_slice)
+            } else {
+                score_body(&state, body_slice, handler_start, false)
+            };
+        let bucket = match bucket_result {
             Ok(bucket) => bucket,
             Err(_) => RAW_BAD_REQUEST,
         };
@@ -444,7 +463,15 @@ fn handle_handoff_http_connection(fd: OwnedFd, state: AppState) -> io::Result<()
                 } else {
                     None
                 };
-                let response = match score_body(&state, body, handler_start, false) {
+                let bucket_result = if state.perf.is_none()
+                    && !state.log_search_avg
+                    && state.parser == ApiParser::Fast
+                {
+                    score_body_fast_bucket(&state, body)
+                } else {
+                    score_body(&state, body, handler_start, false)
+                };
+                let response = match bucket_result {
                     Ok(bucket) => handoff_response_for_bucket(bucket),
                     Err(_) => HTTP_BAD_REQUEST,
                 };
