@@ -8,10 +8,20 @@ use axum::{
 };
 use bytes::Bytes;
 use memmap2::MmapOptions;
+#[cfg(unix)]
+use std::fs;
 use std::fs::File;
 use std::io;
+#[cfg(unix)]
+use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+#[cfg(unix)]
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+#[cfg(unix)]
+use std::thread;
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -57,6 +67,43 @@ static TOTAL_US: AtomicU64 = AtomicU64::new(0);
 
 const RAW_BAD_REQUEST: u8 = 255;
 const RAW_MAX_BODY_BYTES: usize = 8192;
+#[cfg(unix)]
+const HANDOFF_MAX_HEADER_BYTES: usize = 4096;
+#[cfg(unix)]
+const HANDOFF_BUFFER_BYTES: usize = HANDOFF_MAX_HEADER_BYTES + RAW_MAX_BODY_BYTES + 2048;
+#[cfg(unix)]
+const HANDOFF_CONTROL_STACK_BYTES: usize = 64 * 1024;
+#[cfg(unix)]
+const HANDOFF_CLIENT_STACK_BYTES: usize = 1024 * 1024;
+
+#[cfg(unix)]
+const HTTP_BAD_REQUEST: &[u8] =
+    b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+#[cfg(unix)]
+const HTTP_NOT_FOUND: &[u8] =
+    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+#[cfg(unix)]
+const HTTP_METHOD_NOT_ALLOWED: &[u8] =
+    b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+#[cfg(unix)]
+const HTTP_PAYLOAD_TOO_LARGE: &[u8] =
+    b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+#[cfg(unix)]
+const HTTP_READY_OK: &[u8] =
+    b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n";
+
+#[cfg(unix)]
+const HTTP_SCORE_0: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 33\r\nConnection: keep-alive\r\n\r\n{\"approved\":true,\"fraud_score\":0}";
+#[cfg(unix)]
+const HTTP_SCORE_1: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 35\r\nConnection: keep-alive\r\n\r\n{\"approved\":true,\"fraud_score\":0.2}";
+#[cfg(unix)]
+const HTTP_SCORE_2: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 35\r\nConnection: keep-alive\r\n\r\n{\"approved\":true,\"fraud_score\":0.4}";
+#[cfg(unix)]
+const HTTP_SCORE_3: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 36\r\nConnection: keep-alive\r\n\r\n{\"approved\":false,\"fraud_score\":0.6}";
+#[cfg(unix)]
+const HTTP_SCORE_4: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 36\r\nConnection: keep-alive\r\n\r\n{\"approved\":false,\"fraud_score\":0.8}";
+#[cfg(unix)]
+const HTTP_SCORE_5: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 34\r\nConnection: keep-alive\r\n\r\n{\"approved\":false,\"fraud_score\":1}";
 
 async fn health_check(State(state): State<AppState>) -> StatusCode {
     if state.ready.load(Ordering::Relaxed) {
@@ -253,6 +300,487 @@ async fn handle_raw_connection(mut stream: TcpStream, state: AppState) -> io::Re
     }
 }
 
+#[cfg(unix)]
+fn run_fd_handoff_server(listen: String, state: AppState) -> io::Result<()> {
+    let path = listen.strip_prefix("unix:").unwrap_or(&listen).to_string();
+    let _ = fs::remove_file(&path);
+    let listener = UnixListener::bind(&path)?;
+    eprintln!("FD handoff server listening on {}", path);
+
+    for control in listener.incoming() {
+        let control = control?;
+        let state = state.clone();
+        thread::Builder::new()
+            .name("fd-control".to_string())
+            .stack_size(HANDOFF_CONTROL_STACK_BYTES)
+            .spawn(move || {
+                if let Err(err) = handle_fd_control_connection(control, state) {
+                    if err.kind() != io::ErrorKind::UnexpectedEof {
+                        eprintln!("fd control error: {}", err);
+                    }
+                }
+            })?;
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn handle_fd_control_connection(control: UnixStream, state: AppState) -> io::Result<()> {
+    loop {
+        let Some(fd) = recv_fd_blocking(&control)? else {
+            return Ok(());
+        };
+        let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+        let state = state.clone();
+        thread::Builder::new()
+            .name("fd-client".to_string())
+            .stack_size(HANDOFF_CLIENT_STACK_BYTES)
+            .spawn(move || {
+                if let Err(err) = handle_handoff_http_connection(owned, state) {
+                    if err.kind() != io::ErrorKind::UnexpectedEof
+                        && err.kind() != io::ErrorKind::ConnectionReset
+                        && err.kind() != io::ErrorKind::BrokenPipe
+                    {
+                        eprintln!("fd client error: {}", err);
+                    }
+                }
+            })?;
+    }
+}
+
+#[cfg(unix)]
+fn recv_fd_blocking(control: &UnixStream) -> io::Result<Option<RawFd>> {
+    let mut byte = [0u8; 1];
+    let mut iov = libc::iovec {
+        iov_base: byte.as_mut_ptr().cast(),
+        iov_len: byte.len(),
+    };
+    let mut control_buf = [0u8; 64];
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control_buf.as_mut_ptr().cast();
+    msg.msg_controllen = control_buf.len();
+
+    let received = unsafe { libc::recvmsg(control.as_raw_fd(), &mut msg, 0) };
+    if received == 0 {
+        return Ok(None);
+    }
+    if received < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    unsafe {
+        let cmsg = libc::CMSG_FIRSTHDR(&msg);
+        if cmsg.is_null()
+            || (*cmsg).cmsg_level != libc::SOL_SOCKET
+            || (*cmsg).cmsg_type != libc::SCM_RIGHTS
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "control message did not contain fd",
+            ));
+        }
+
+        let mut fd: RawFd = -1;
+        std::ptr::copy_nonoverlapping(
+            libc::CMSG_DATA(cmsg).cast::<u8>(),
+            &mut fd as *mut RawFd as *mut u8,
+            std::mem::size_of::<RawFd>(),
+        );
+        if fd < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "received invalid fd",
+            ));
+        }
+        Ok(Some(fd))
+    }
+}
+
+#[cfg(unix)]
+fn handle_handoff_http_connection(fd: OwnedFd, state: AppState) -> io::Result<()> {
+    let mut stream = std::net::TcpStream::from(fd);
+    tune_std_socket(&stream);
+    stream.set_nonblocking(false)?;
+
+    let mut buf = [0u8; HANDOFF_BUFFER_BYTES];
+    let mut len = 0usize;
+
+    loop {
+        let request = loop {
+            match parse_handoff_request(&buf[..len]) {
+                Ok(Some(request)) => break request,
+                Ok(None) => {
+                    if len == buf.len() {
+                        stream.write_all(HTTP_PAYLOAD_TOO_LARGE)?;
+                        return Ok(());
+                    }
+                    match stream.read(&mut buf[len..]) {
+                        Ok(0) => return Ok(()),
+                        Ok(read) => {
+                            len += read;
+                        }
+                        Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                        Err(err) => return Err(err),
+                    }
+                }
+                Err(err) => {
+                    stream.write_all(err.response)?;
+                    return Ok(());
+                }
+            }
+        };
+
+        match request.route {
+            HandoffRoute::Ready => {
+                stream.write_all(HTTP_READY_OK)?;
+            }
+            HandoffRoute::FraudScore => {
+                let body = &buf[request.header_len..request.total_len];
+                let handler_start = if state.perf.is_some() || state.log_search_avg {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
+                let response = match score_body(&state, body, handler_start, false) {
+                    Ok(bucket) => handoff_response_for_bucket(bucket),
+                    Err(_) => HTTP_BAD_REQUEST,
+                };
+                stream.write_all(response)?;
+            }
+        }
+
+        if request.total_len == len {
+            len = 0;
+        } else {
+            buf.copy_within(request.total_len..len, 0);
+            len -= request.total_len;
+        }
+
+        if request.close_after_response {
+            return Ok(());
+        }
+    }
+}
+
+#[cfg(unix)]
+fn handoff_response_for_bucket(bucket: u8) -> &'static [u8] {
+    match bucket {
+        0 => HTTP_SCORE_0,
+        1 => HTTP_SCORE_1,
+        2 => HTTP_SCORE_2,
+        3 => HTTP_SCORE_3,
+        4 => HTTP_SCORE_4,
+        5 => HTTP_SCORE_5,
+        _ => HTTP_SCORE_5,
+    }
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HandoffRoute {
+    Ready,
+    FraudScore,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HandoffRequest {
+    route: HandoffRoute,
+    header_len: usize,
+    total_len: usize,
+    close_after_response: bool,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HandoffParseError {
+    response: &'static [u8],
+}
+
+#[cfg(unix)]
+fn parse_handoff_request(buf: &[u8]) -> Result<Option<HandoffRequest>, HandoffParseError> {
+    let Some(header_end) = find_header_end(buf) else {
+        if buf.len() > HANDOFF_MAX_HEADER_BYTES {
+            return Err(HandoffParseError {
+                response: HTTP_PAYLOAD_TOO_LARGE,
+            });
+        }
+        return Ok(None);
+    };
+
+    let header_len = header_end + 4;
+    if header_len > HANDOFF_MAX_HEADER_BYTES {
+        return Err(HandoffParseError {
+            response: HTTP_PAYLOAD_TOO_LARGE,
+        });
+    }
+    let head = parse_handoff_head(&buf[..header_len])?;
+    let total_len = header_len + head.content_length;
+    if total_len > HANDOFF_MAX_HEADER_BYTES + RAW_MAX_BODY_BYTES {
+        return Err(HandoffParseError {
+            response: HTTP_PAYLOAD_TOO_LARGE,
+        });
+    }
+    if buf.len() < total_len {
+        return Ok(None);
+    }
+
+    Ok(Some(HandoffRequest {
+        route: head.route,
+        header_len,
+        total_len,
+        close_after_response: head.close_after_response,
+    }))
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HandoffHead {
+    route: HandoffRoute,
+    content_length: usize,
+    close_after_response: bool,
+}
+
+#[cfg(unix)]
+fn parse_handoff_head(header: &[u8]) -> Result<HandoffHead, HandoffParseError> {
+    const POST_FRAUD_11: &[u8] = b"POST /fraud-score HTTP/1.1\r\n";
+    const POST_FRAUD_10: &[u8] = b"POST /fraud-score HTTP/1.0\r\n";
+    const GET_READY_11: &[u8] = b"GET /ready HTTP/1.1\r\n";
+    const GET_READY_10: &[u8] = b"GET /ready HTTP/1.0\r\n";
+
+    let (route, http10) = if header.starts_with(POST_FRAUD_11) {
+        (HandoffRoute::FraudScore, false)
+    } else if header.starts_with(POST_FRAUD_10) {
+        (HandoffRoute::FraudScore, true)
+    } else if header.starts_with(GET_READY_11) {
+        (HandoffRoute::Ready, false)
+    } else if header.starts_with(GET_READY_10) {
+        (HandoffRoute::Ready, true)
+    } else {
+        return parse_handoff_head_generic(header);
+    };
+
+    if find_subslice(header, b"\r\nTransfer-Encoding:")
+        .or_else(|| find_subslice(header, b"\r\ntransfer-encoding:"))
+        .is_some()
+    {
+        return Err(HandoffParseError {
+            response: HTTP_BAD_REQUEST,
+        });
+    }
+
+    let content_length = if route == HandoffRoute::FraudScore {
+        let Some(value_start) = find_content_length_value(header) else {
+            return Err(HandoffParseError {
+                response: HTTP_BAD_REQUEST,
+            });
+        };
+        parse_usize_decimal_header(header, value_start)?
+    } else {
+        0
+    };
+
+    if route == HandoffRoute::FraudScore && content_length == 0 {
+        return Err(HandoffParseError {
+            response: HTTP_BAD_REQUEST,
+        });
+    }
+    if content_length > RAW_MAX_BODY_BYTES {
+        return Err(HandoffParseError {
+            response: HTTP_PAYLOAD_TOO_LARGE,
+        });
+    }
+
+    Ok(HandoffHead {
+        route,
+        content_length,
+        close_after_response: http10 || contains_connection_close_fast(header),
+    })
+}
+
+#[cfg(unix)]
+fn parse_handoff_head_generic(header: &[u8]) -> Result<HandoffHead, HandoffParseError> {
+    let header_str = std::str::from_utf8(header).map_err(|_| HandoffParseError {
+        response: HTTP_BAD_REQUEST,
+    })?;
+    let mut lines = header_str.split("\r\n");
+    let request_line = lines.next().ok_or(HandoffParseError {
+        response: HTTP_BAD_REQUEST,
+    })?;
+
+    let mut parts = request_line.split_ascii_whitespace();
+    let method = parts.next().ok_or(HandoffParseError {
+        response: HTTP_BAD_REQUEST,
+    })?;
+    let path = parts.next().ok_or(HandoffParseError {
+        response: HTTP_BAD_REQUEST,
+    })?;
+    let version = parts.next().ok_or(HandoffParseError {
+        response: HTTP_BAD_REQUEST,
+    })?;
+    if version != "HTTP/1.1" && version != "HTTP/1.0" {
+        return Err(HandoffParseError {
+            response: HTTP_BAD_REQUEST,
+        });
+    }
+
+    let route = match (method, path) {
+        ("GET", "/ready") => HandoffRoute::Ready,
+        ("POST", "/fraud-score") => HandoffRoute::FraudScore,
+        ("GET" | "POST", _) => {
+            return Err(HandoffParseError {
+                response: HTTP_NOT_FOUND,
+            })
+        }
+        _ => {
+            return Err(HandoffParseError {
+                response: HTTP_METHOD_NOT_ALLOWED,
+            })
+        }
+    };
+
+    let mut content_length = None;
+    let mut close_after_response = version == "HTTP/1.0";
+    let mut chunked = false;
+
+    for line in lines {
+        if line.is_empty() {
+            break;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            return Err(HandoffParseError {
+                response: HTTP_BAD_REQUEST,
+            });
+        };
+        let value = value.trim();
+        if name.eq_ignore_ascii_case("content-length") {
+            content_length = Some(value.parse::<usize>().map_err(|_| HandoffParseError {
+                response: HTTP_BAD_REQUEST,
+            })?);
+        } else if name.eq_ignore_ascii_case("connection") {
+            if value.eq_ignore_ascii_case("close") {
+                close_after_response = true;
+            }
+        } else if name.eq_ignore_ascii_case("transfer-encoding")
+            && value.to_ascii_lowercase().contains("chunked")
+        {
+            chunked = true;
+        }
+    }
+
+    if chunked {
+        return Err(HandoffParseError {
+            response: HTTP_BAD_REQUEST,
+        });
+    }
+
+    let content_length = content_length.unwrap_or(0);
+    if route == HandoffRoute::FraudScore && content_length == 0 {
+        return Err(HandoffParseError {
+            response: HTTP_BAD_REQUEST,
+        });
+    }
+    if content_length > RAW_MAX_BODY_BYTES {
+        return Err(HandoffParseError {
+            response: HTTP_PAYLOAD_TOO_LARGE,
+        });
+    }
+
+    Ok(HandoffHead {
+        route,
+        content_length,
+        close_after_response,
+    })
+}
+
+#[cfg(unix)]
+fn find_content_length_value(header: &[u8]) -> Option<usize> {
+    find_subslice(header, b"\r\nContent-Length:")
+        .or_else(|| find_subslice(header, b"\r\ncontent-length:"))
+        .map(|idx| {
+            let mut pos = idx + b"\r\nContent-Length:".len();
+            while header.get(pos) == Some(&b' ') || header.get(pos) == Some(&b'\t') {
+                pos += 1;
+            }
+            pos
+        })
+}
+
+#[cfg(unix)]
+fn parse_usize_decimal_header(header: &[u8], mut pos: usize) -> Result<usize, HandoffParseError> {
+    let mut value = 0usize;
+    let mut found = false;
+    while let Some(&byte) = header.get(pos) {
+        match byte {
+            b'0'..=b'9' => {
+                found = true;
+                value = value
+                    .checked_mul(10)
+                    .and_then(|v| v.checked_add((byte - b'0') as usize))
+                    .ok_or(HandoffParseError {
+                        response: HTTP_BAD_REQUEST,
+                    })?;
+            }
+            b'\r' | b'\n' => break,
+            b' ' | b'\t' if !found => {}
+            _ => {
+                return Err(HandoffParseError {
+                    response: HTTP_BAD_REQUEST,
+                })
+            }
+        }
+        pos += 1;
+    }
+    if found {
+        Ok(value)
+    } else {
+        Err(HandoffParseError {
+            response: HTTP_BAD_REQUEST,
+        })
+    }
+}
+
+#[cfg(unix)]
+fn contains_connection_close_fast(header: &[u8]) -> bool {
+    find_subslice(header, b"\r\nConnection: close")
+        .or_else(|| find_subslice(header, b"\r\nconnection: close"))
+        .is_some()
+}
+
+#[cfg(unix)]
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+#[cfg(unix)]
+fn find_header_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
+#[cfg(unix)]
+fn tune_std_socket(stream: &std::net::TcpStream) {
+    let _ = stream.set_nodelay(true);
+    let fd = stream.as_raw_fd();
+    unsafe {
+        let one: libc::c_int = 1;
+        let _ = libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_QUICKACK,
+            &one as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of_val(&one) as libc::socklen_t,
+        );
+    }
+}
+
 fn tune_socket(stream: &TcpStream) {
     let _ = stream.set_nodelay(true);
 
@@ -274,6 +802,8 @@ fn main() {
         .parse()
         .unwrap_or(8080);
     let raw_listen = std::env::var("API_RAW_LISTEN").ok();
+    #[cfg(unix)]
+    let fd_listen = std::env::var("API_FD_LISTEN").ok();
     let perf = perf::PerfConfig::from_env().map(|config| {
         eprintln!(
             "PERF_TRACE enabled: every={} slow_us={} sample={}",
@@ -341,6 +871,16 @@ fn main() {
             });
         }
 
+        #[cfg(unix)]
+        if let Some(fd_listen) = fd_listen {
+            let fd_state = state.clone();
+            tokio::task::spawn_blocking(move || {
+                if let Err(err) = run_fd_handoff_server(fd_listen, fd_state) {
+                    eprintln!("fd handoff server exited with error: {}", err);
+                }
+            });
+        }
+
         let app = Router::new()
             .route("/ready", get(health_check))
             .route("/fraud-score", post(fraud_score))
@@ -352,4 +892,53 @@ fn main() {
         eprintln!("Listening on port {}", port);
         axum::serve(listener, app).await.expect("server error");
     });
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn handoff_parser_waits_for_fragmented_body() {
+        let req = b"POST /fraud-score HTTP/1.1\r\nContent-Length: 5\r\n\r\nhe";
+        assert!(parse_handoff_request(req).unwrap().is_none());
+
+        let req = b"POST /fraud-score HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello";
+        let parsed = parse_handoff_request(req).unwrap().unwrap();
+        assert_eq!(parsed.route, HandoffRoute::FraudScore);
+        assert_eq!(&req[parsed.header_len..parsed.total_len], b"hello");
+        assert!(!parsed.close_after_response);
+    }
+
+    #[test]
+    fn handoff_parser_keeps_ready_lightweight() {
+        let req = b"GET /ready HTTP/1.1\r\nHost: lb\r\n\r\n";
+        let parsed = parse_handoff_request(req).unwrap().unwrap();
+        assert_eq!(parsed.route, HandoffRoute::Ready);
+        assert_eq!(parsed.header_len, parsed.total_len);
+    }
+
+    #[test]
+    fn handoff_parser_rejects_chunked() {
+        let req = b"POST /fraud-score HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let err = parse_handoff_request(req).unwrap_err();
+        assert_eq!(err.response, HTTP_BAD_REQUEST);
+    }
+
+    #[test]
+    fn handoff_score_responses_match_body_lengths() {
+        for bucket in 0..=5 {
+            let response = handoff_response_for_bucket(bucket);
+            let header_end = find_header_end(response).unwrap() + 4;
+            let content_len = std::str::from_utf8(&response[..header_end])
+                .unwrap()
+                .split("\r\n")
+                .find_map(|line| {
+                    line.strip_prefix("Content-Length:")
+                        .map(|value| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap();
+            assert_eq!(content_len, response.len() - header_end);
+        }
+    }
 }
