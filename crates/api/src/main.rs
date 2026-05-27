@@ -37,7 +37,7 @@ use search::Index;
 
 #[derive(Clone)]
 struct AppState {
-    index: Arc<Index>,
+    index: Option<Arc<Index>>,
     constants: Arc<shared::Constants>,
     ready: Arc<AtomicBool>,
     perf: Option<Arc<perf::PerfCollector>>,
@@ -69,6 +69,7 @@ impl ApiParser {
 enum ApiClassifier {
     Off,
     Tree,
+    TreeOnly,
 }
 
 impl ApiClassifier {
@@ -79,6 +80,7 @@ impl ApiClassifier {
             .as_str()
         {
             "tree" => ApiClassifier::Tree,
+            "tree_only" | "tree-only" => ApiClassifier::TreeOnly,
             _ => ApiClassifier::Off,
         }
     }
@@ -179,7 +181,17 @@ fn score_body(
     handler_start: Option<Instant>,
     build_response: bool,
 ) -> Result<u8, StatusCode> {
+    if state.perf.is_none() && !state.log_search_avg && state.classifier != ApiClassifier::Off {
+        if let Some(approved) = classifier::classify_approved(body_bytes) {
+            return Ok(if approved { 0 } else { 5 });
+        }
+        if state.index.is_none() {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    }
+
     if let Some(perf) = state.perf.as_deref() {
+        let index = exact_index(state)?;
         let handler_start = handler_start.unwrap_or_else(Instant::now);
         let request = perf.begin_request();
 
@@ -202,13 +214,9 @@ fn score_body(
         let mut search_trace = perf::SearchTrace::default();
         let search_start = Instant::now();
         let (_approved, fraud_score_val) = if let Some((qv16, query_key)) = fast_parsed {
-            state
-                .index
-                .search_vector_with_trace(&qv16, query_key, &mut search_trace)
+            index.search_vector_with_trace(&qv16, query_key, &mut search_trace)
         } else {
-            state
-                .index
-                .search_with_trace(parsed_payload.unwrap(), &mut search_trace)
+            index.search_with_trace(parsed_payload.unwrap(), &mut search_trace)
         };
         let search_total_us = perf::elapsed_us(search_start);
 
@@ -236,20 +244,21 @@ fn score_body(
         return Ok(bucket);
     }
 
+    let index = exact_index(state)?;
     let (_approved, fraud_score_val) = if state.parser == ApiParser::Fast {
         if let Some((qv16, query_key)) =
             shared::parse_payload_to_i16_and_key(body_bytes, &state.constants)
         {
-            state.index.search_vector(&qv16, query_key)
+            index.search_vector(&qv16, query_key)
         } else {
             let payload: shared::types::Payload<'_> =
                 serde_json::from_slice(body_bytes).map_err(|_e| StatusCode::BAD_REQUEST)?;
-            state.index.search(&payload)
+            index.search(&payload)
         }
     } else {
         let payload: shared::types::Payload<'_> =
             serde_json::from_slice(body_bytes).map_err(|_e| StatusCode::BAD_REQUEST)?;
-        state.index.search(&payload)
+        index.search(&payload)
     };
 
     if state.log_search_avg {
@@ -272,22 +281,31 @@ fn score_body(
 }
 
 fn score_body_fast_bucket(state: &AppState, body_bytes: &[u8]) -> Result<u8, StatusCode> {
-    if state.classifier == ApiClassifier::Tree {
+    if state.classifier == ApiClassifier::Tree || state.classifier == ApiClassifier::TreeOnly {
         if let Some(approved) = classifier::classify_approved(body_bytes) {
             return Ok(if approved { 0 } else { 5 });
         }
+        if state.index.is_none() {
+            return Err(StatusCode::BAD_REQUEST);
+        }
     }
 
+    let index = exact_index(state)?;
     if let Some((qv16, query_key)) =
         shared::parse_payload_to_i16_and_key(body_bytes, &state.constants)
     {
-        return Ok(state.index.search_bucket_vector(&qv16, query_key));
+        return Ok(index.search_bucket_vector(&qv16, query_key));
     }
 
     let payload: shared::types::Payload<'_> =
         serde_json::from_slice(body_bytes).map_err(|_e| StatusCode::BAD_REQUEST)?;
-    let (_approved, fraud_score_val) = state.index.search(&payload);
+    let (_approved, fraud_score_val) = index.search(&payload);
     Ok(score_bucket_for_fraud_score(fraud_score_val))
+}
+
+#[inline]
+fn exact_index(state: &AppState) -> Result<&Index, StatusCode> {
+    state.index.as_deref().ok_or(StatusCode::BAD_REQUEST)
 }
 
 async fn run_raw_server(listen: String, state: AppState) -> io::Result<()> {
@@ -878,37 +896,48 @@ fn main() {
         .expect("failed to build tokio runtime");
 
     runtime.block_on(async move {
-        eprintln!("Loading index from {}...", index_path);
-        let file = File::open(&index_path).expect("failed to open index.bin");
-        let mmap = unsafe { MmapOptions::new().map(&file).expect("failed to mmap index") };
+        let index = if classifier == ApiClassifier::TreeOnly {
+            eprintln!("API classifier tree_only enabled; skipping index mmap/warmup.");
+            None
+        } else {
+            eprintln!("Loading index from {}...", index_path);
+            let file = File::open(&index_path).expect("failed to open index.bin");
+            let mmap = unsafe { MmapOptions::new().map(&file).expect("failed to mmap index") };
 
-        #[cfg(unix)]
-        if std::env::var("MLOCK_INDEX").ok().as_deref() == Some("1") {
-            unsafe {
-                let ptr = mmap.as_ptr() as *const libc::c_void;
-                let len = mmap.len();
-                if libc::mlock(ptr, len) == 0 {
-                    eprintln!("Successfully locked index memory of size {} bytes in RAM via mlock.", len);
-                } else {
-                    let err = std::io::Error::last_os_error();
-                    eprintln!("Warning: Failed to lock index memory in RAM: {}. Performance under memory pressure may degrade.", err);
+            #[cfg(unix)]
+            if std::env::var("MLOCK_INDEX").ok().as_deref() == Some("1") {
+                unsafe {
+                    let ptr = mmap.as_ptr() as *const libc::c_void;
+                    let len = mmap.len();
+                    if libc::mlock(ptr, len) == 0 {
+                        eprintln!(
+                            "Successfully locked index memory of size {} bytes in RAM via mlock.",
+                            len
+                        );
+                    } else {
+                        let err = std::io::Error::last_os_error();
+                        eprintln!("Warning: Failed to lock index memory in RAM: {}. Performance under memory pressure may degrade.", err);
+                    }
                 }
             }
-        }
 
-        let index = Arc::new(Index::new(mmap));
+            Some(Arc::new(Index::new(mmap)))
+        };
         let constants = Arc::new(shared::Constants::load_embedded());
         let ready = Arc::new(AtomicBool::new(false));
 
-        // Warmup in background
-        let index_clone = Arc::clone(&index);
-        let ready_clone = Arc::clone(&ready);
-        tokio::task::spawn_blocking(move || {
-            eprintln!("Warming up index...");
-            index_clone.warmup();
-            eprintln!("Index warm. Serving on port {}", port);
-            ready_clone.store(true, Ordering::Relaxed);
-        });
+        if let Some(index_clone) = index.as_ref().map(Arc::clone) {
+            let ready_clone = Arc::clone(&ready);
+            tokio::task::spawn_blocking(move || {
+                eprintln!("Warming up index...");
+                index_clone.warmup();
+                eprintln!("Index warm. Serving on port {}", port);
+                ready_clone.store(true, Ordering::Relaxed);
+            });
+        } else {
+            eprintln!("Classifier-only API ready on port {}", port);
+            ready.store(true, Ordering::Relaxed);
+        }
 
         let state = AppState {
             index,
