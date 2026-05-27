@@ -21,6 +21,8 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 #[cfg(unix)]
+use std::sync::{mpsc, Mutex};
+#[cfg(unix)]
 use std::thread;
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -425,6 +427,14 @@ fn run_minimal_ready_server(port: u16, ready: Arc<AtomicBool>) -> io::Result<()>
 
 #[cfg(unix)]
 fn handle_fd_control_connection(control: UnixStream, state: AppState) -> io::Result<()> {
+    let workers = std::env::var("API_FD_WORKERS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    if workers > 0 {
+        return handle_fd_control_connection_with_workers(control, state, workers);
+    }
+
     loop {
         let Some(fd) = recv_fd_blocking(&control)? else {
             return Ok(());
@@ -444,6 +454,51 @@ fn handle_fd_control_connection(control: UnixStream, state: AppState) -> io::Res
                     }
                 }
             })?;
+    }
+}
+
+#[cfg(unix)]
+fn handle_fd_control_connection_with_workers(
+    control: UnixStream,
+    state: AppState,
+    workers: usize,
+) -> io::Result<()> {
+    let (sender, receiver) = mpsc::sync_channel::<OwnedFd>(workers.saturating_mul(2).max(1));
+    let receiver = Arc::new(Mutex::new(receiver));
+
+    for worker_id in 0..workers {
+        let receiver = Arc::clone(&receiver);
+        let state = state.clone();
+        thread::Builder::new()
+            .name(format!("fd-worker-{}", worker_id))
+            .stack_size(HANDOFF_CLIENT_STACK_BYTES)
+            .spawn(move || loop {
+                let fd = {
+                    let guard = receiver.lock().expect("fd worker receiver poisoned");
+                    guard.recv()
+                };
+                let Ok(fd) = fd else {
+                    return;
+                };
+                if let Err(err) = handle_handoff_http_connection(fd, state.clone()) {
+                    if err.kind() != io::ErrorKind::UnexpectedEof
+                        && err.kind() != io::ErrorKind::ConnectionReset
+                        && err.kind() != io::ErrorKind::BrokenPipe
+                    {
+                        eprintln!("fd client error: {}", err);
+                    }
+                }
+            })?;
+    }
+
+    loop {
+        let Some(fd) = recv_fd_blocking(&control)? else {
+            return Ok(());
+        };
+        let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+        if sender.send(owned).is_err() {
+            return Ok(());
+        }
     }
 }
 
