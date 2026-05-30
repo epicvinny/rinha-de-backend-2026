@@ -34,6 +34,8 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 mod classifier;
 #[cfg(target_os = "linux")]
 mod epoll_server;
+#[cfg(target_os = "linux")]
+mod uring_server;
 mod perf;
 mod search;
 mod tree_model;
@@ -371,6 +373,12 @@ async fn handle_raw_connection(mut stream: TcpStream, state: AppState) -> io::Re
 
 #[cfg(unix)]
 fn run_fd_handoff_server(listen: String, state: AppState) -> io::Result<()> {
+    // Experimental io_uring reactor (Stage 7), opt-in via API_FD_URING=1.
+    #[cfg(target_os = "linux")]
+    if std::env::var("API_FD_URING").ok().as_deref() == Some("1") {
+        return uring_server::run(listen, state);
+    }
+
     // Default to the single-threaded epoll + EPIOCSPARAMS busy-poll reactor on
     // Linux (set API_FD_EPOLL=0 to revert to the blocking-thread model for A/B).
     #[cfg(target_os = "linux")]
