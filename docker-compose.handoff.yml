@@ -9,6 +9,9 @@ services:
       - BACKENDS=unix:/sockets/api1-fd.sock,unix:/sockets/api2-fd.sock
       # Forked self-warm: prime accept->handoff->classify path before real load.
       - LB_SELF_WARM=2000
+      # In-process pin (compose cpuset is ignored on the host); keep LB off the
+      # API cores (0,1).
+      - LB_PIN_CPU=2
     volumes:
       - backend-sockets:/sockets
     security_opt:

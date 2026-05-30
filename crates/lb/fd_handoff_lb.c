@@ -5,6 +5,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -316,9 +317,27 @@ static void self_warm(int port, int count) {
     }
 }
 
+/* In-process CPU pin (compose cpuset is ignored on the official host). Pin the
+   LB away from the API cores (api1->0, api2->1 via API_PIN_CPU) to cut cache
+   contention — the top-1 ASM pins the LB to its own cores. Set LB_PIN_CPU. */
+static void pin_cpu(void) {
+    const char* e = getenv("LB_PIN_CPU");
+    if (e == NULL || e[0] == '\0') return;
+    int cpu = atoi(e);
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(cpu, &set);
+    if (sched_setaffinity(0, sizeof(set), &set) == 0) {
+        fprintf(stderr, "LB pinned to CPU %d\n", cpu);
+    } else {
+        fprintf(stderr, "LB pin to CPU %d failed: %s\n", cpu, strerror(errno));
+    }
+}
+
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
     signal(SIGCHLD, SIG_IGN); /* auto-reap the self-warm child */
+    pin_cpu();
     parse_upstreams();
     connect_all();
 
