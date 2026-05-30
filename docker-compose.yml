@@ -1,6 +1,6 @@
 services:
   lb:
-    image: visuzano/rinha-2026:5cb5c18
+    image: visuzano/rinha-2026:f91741b
     command: ["/opt/lb"]
     ports:
       - "9999:9999"
@@ -23,7 +23,7 @@ services:
       - rinha
 
   api1:
-    image: visuzano/rinha-2026:5cb5c18
+    image: visuzano/rinha-2026:f91741b
     environment:
       - INDEX_PATH=/opt/index.bin
       - PORT=8080
@@ -46,7 +46,7 @@ services:
       - rinha
 
   api2:
-    image: visuzano/rinha-2026:5cb5c18
+    image: visuzano/rinha-2026:f91741b
     environment:
       - INDEX_PATH=/opt/index.bin
       - PORT=8080
