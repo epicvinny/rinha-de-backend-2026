@@ -19,3 +19,7 @@ CLAUDE.md
 AGENTS.md
 sauce-secret/
 /specs/rinha-2026/
+
+# validate tool outputs (regenerated each run)
+/mismatches.csv
+/report.html
