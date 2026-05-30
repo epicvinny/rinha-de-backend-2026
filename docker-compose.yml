@@ -1,0 +1,118 @@
+# Rinha de Backend 2026 — submission (test files only; no source code).
+# Winning topology: C FD-handoff load balancer (SCM_RIGHTS round-robin) + 2 API
+# instances running a single-threaded epoll reactor with EPIOCSPARAMS NAPI
+# busy-poll (kernel >= 6.9; graceful fallback) and the tree-only classifier.
+# Image is prebuilt and public on Docker Hub.
+services:
+  lb:
+    image: visuzano/rinha-2026:latest
+    command: ["/opt/fd_handoff_lb"]
+    cpuset: "2,3"
+    ports:
+      - "9999:9999"
+    environment:
+      - LB_LISTEN=0.0.0.0:9999
+      - BACKENDS=unix:/sockets/api1-fd.sock,unix:/sockets/api2-fd.sock
+      - LB_SELF_WARM=2000
+    volumes:
+      - backend-sockets:/sockets
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    depends_on:
+      api1:
+        condition: service_healthy
+      api2:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "0.20"
+          memory: "30MB"
+    networks:
+      - rinha
+
+  api1:
+    image: visuzano/rinha-2026:latest
+    cpuset: "0"
+    environment:
+      - PORT=8080
+      - API_FD_LISTEN=/sockets/api1-fd.sock
+      - API_PARSER=fast
+      - API_CLASSIFIER=tree_only
+      - API_FD_EPOLL=1
+      - API_BUSY_POLL_US=50
+      - API_BUSY_POLL_BUDGET=8
+      - API_PREFER_BUSY_POLL=1
+      - API_PIN_CPU=0
+    volumes:
+      - backend-sockets:/sockets
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+      memlock:
+        soft: -1
+        hard: -1
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/ready"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.40"
+          memory: "160MB"
+    networks:
+      - rinha
+
+  api2:
+    image: visuzano/rinha-2026:latest
+    cpuset: "1"
+    environment:
+      - PORT=8080
+      - API_FD_LISTEN=/sockets/api2-fd.sock
+      - API_PARSER=fast
+      - API_CLASSIFIER=tree_only
+      - API_FD_EPOLL=1
+      - API_BUSY_POLL_US=50
+      - API_BUSY_POLL_BUDGET=8
+      - API_PREFER_BUSY_POLL=1
+      - API_PIN_CPU=1
+    volumes:
+      - backend-sockets:/sockets
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+      memlock:
+        soft: -1
+        hard: -1
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/ready"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.40"
+          memory: "160MB"
+    networks:
+      - rinha
+
+networks:
+  rinha:
+    driver: bridge
+
+volumes:
+  backend-sockets:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: size=4m,mode=0777
