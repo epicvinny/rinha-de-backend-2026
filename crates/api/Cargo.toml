@@ -13,3 +13,4 @@ memmap2 = "0.9"
 bytes = "1"
 libc = "0.2"
 mimalloc = { version = "0.1", default-features = false }
+io-uring = "0.7.12"
