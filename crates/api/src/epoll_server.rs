@@ -18,6 +18,7 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixListener;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use crate::{
@@ -473,6 +474,13 @@ fn process_buffered(
     }
 }
 
+/// Whether to re-arm `TCP_QUICKACK` after every read (the flag is one-shot;
+/// the kernel clears it after each ACK). Default OFF: this adds a `setsockopt`
+/// to the per-request hot path, which regressed p99 on the target (preview
+/// #7385: 0.387 -> 0.403ms). Toggle with `API_QUICKACK_REARM=1` for A/B. The
+/// one-time QUICKACK set in `tune_client_fd` stays regardless.
+static REARM_QUICKACK: AtomicBool = AtomicBool::new(false);
+
 #[inline]
 fn set_quickack(fd: RawFd) {
     unsafe {
@@ -544,10 +552,13 @@ fn drive(epfd: RawFd, fd: RawFd, conn: &mut Conn, state: &AppState, trace: &mut 
                 trace.push_read(t.elapsed().as_nanos() as u64);
             }
             conn.len += n as usize;
-            // Re-arm QUICKACK (one-shot; kernel clears it after each ACK) so the
-            // response's ACK isn't delayed. perf-handoff-learnings: QUICKACK is
-            // worth ~1.2ms here.
-            set_quickack(fd);
+            // Re-arm QUICKACK so the response's ACK isn't delayed. Gated behind
+            // API_QUICKACK_REARM (default OFF): on the target this extra per-read
+            // setsockopt regressed p99 (preview #7385: 0.387 -> 0.403ms). The
+            // one-time set in tune_client_fd remains.
+            if REARM_QUICKACK.load(Ordering::Relaxed) {
+                set_quickack(fd);
+            }
             continue;
         }
         let err = io::Error::last_os_error();
@@ -576,6 +587,13 @@ pub fn run(listen: String, state: AppState) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     configure_busy_poll(epfd);
+
+    let rearm = env_u32("API_QUICKACK_REARM", 0) != 0;
+    REARM_QUICKACK.store(rearm, Ordering::Relaxed);
+    eprintln!(
+        "per-request QUICKACK re-arm: {}",
+        if rearm { "on" } else { "off (default)" }
+    );
 
     epoll_add(epfd, listener_fd, libc::EPOLLIN as u32)?;
 

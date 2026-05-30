@@ -17,12 +17,30 @@
 - **Read first:** this file, then `CLAUDE.md` (submission procedure + 10/day test
   tracker + dead ends), `docs/perf-bottlenecks.md`, `docs/exp-unikernel-scratch.md`.
 
+## ⚠️ UPDATE 2026-05-30 (later) — #7385 REGRESSED; reverted
+- **Preview #7385 came back at p99 0.4029ms — WORSE than #7376's 0.387ms** (perfect
+  detection, 0 5xx either way). The two changes bundled into #7385 both hurt:
+  - **per-request `TCP_QUICKACK` re-arm** (`7c92d83`) — adds a 4th `setsockopt`
+    syscall to the hot path; contradicts our own measured "syscalls dominate" thesis.
+  - **`LB_PIN_CPU=2`** (`dfd89b3`) — likely pins the LB onto a hyperthread sibling of a
+    busy-polling API core (starvation). On 2C/4T, scheme {0,2}=core0/{1,3}=core1 is
+    empirically likely (APIs on 0/1 score 0.387, not the disaster two-spinners-on-one-core
+    would cause), making CPU2 = API1's sibling.
+- **Reverted in code:** per-request QUICKACK re-arm is now gated behind
+  `API_QUICKACK_REARM` (**default OFF**) in `epoll_server.rs` + `uring_server.rs`; the
+  one-time QUICKACK in `tune_client_fd` stays. **LB pin to be dropped via compose**
+  (`LB_PIN_CPU` removed → LB floats). This returns to the #7376 baseline config.
+- **No preview test filed for this revert** (user decision — re-banking the known-good
+  0.387 config doesn't need a test). Clean image + compose prepared for the next sweep batch.
+- **Next:** front-load the cheap env-only sweeps (busy-poll + pinning topology), then the
+  C-static reactor rewrite. See `docs/perf-bottlenecks.md` and the session plan.
+
 
 ## TL;DR
 - We went from broken to **4th place, p99 0.387ms, perfect score** (0 FP/FN, 0 5xx).
 - Topology: **C `fd_handoff_lb` (SCM_RIGHTS round-robin) + 2× API epoll reactor + EPIOCSPARAMS NAPI busy-poll + `tree_only` classifier.**
 - **io_uring is a confirmed DEAD END** (needs `seccomp=unconfined`, which the Rinha forbids).
-- An improved build (epoll + per-request `TCP_QUICKACK` re-arm + LB core-pin) is submitted as preview test #7385 (pending).
+- The #7385 build (epoll + per-request `TCP_QUICKACK` re-arm + LB core-pin) **regressed to 0.403ms and was reverted** — see the UPDATE block at the top.
 - Leaderboard to beat: **#1 asm 0.353ms**, #2 cpp 0.357, #3 rust 0.385.
 
 ## What was done (this work)
@@ -56,8 +74,10 @@ The ~387µs decomposes into: **NAPI/scheduler wakeup + 2–3 syscalls + docker-b
 **Reaching 0.10ms (100µs) is almost certainly infeasible under these constraints.** The world-best on this exact hardware+rules is **0.353ms (hand-written ASM, epoll+busy-poll)**. 100µs would require removing ~250µs that is dominated by **docker-bridge RTT + syscall/wakeup floor** — which need host-mode networking, kernel bypass (AF_XDP/DPDK), or io_uring, all **blocked by the Rinha sandbox** (`privileged:false`, no caps, no seccomp relaxation, bridge-only). So treat 0.10ms as aspirational; **the realistic frontier is ~0.30–0.35ms (beat 0.353).**
 
 ## Roadmap for the next session (in priority order, all within the allowed sandbox)
-1. **Land #7385** (epoll + QUICKACK-rearm + LB-pin). Expect a small win over 0.387. New baseline.
-2. **Tune busy-poll ON TARGET** (1 test each, batch wisely): sweep `API_BUSY_POLL_US` ∈ {25, 50, 100, 200} and `API_BUSY_POLL_BUDGET` ∈ {8, 16, 32, 64}. This is the single biggest target-only knob and can't be tuned on WSL. Pick the best.
+1. **Re-bank the 0.387 baseline** with a clean image: QUICKACK re-arm gated OFF
+   (`API_QUICKACK_REARM` default 0) + LB unpinned (`LB_PIN_CPU` removed). #7385 proved the
+   QUICKACK-rearm + LB-pin combo regressed; this reverts it. (Done in code 2026-05-30.)
+2. **Tune busy-poll + pinning ON TARGET** (1 test each, batch wisely): sweep `API_BUSY_POLL_US` ∈ {25, 50, 100, 200} and `API_BUSY_POLL_BUDGET` ∈ {8, 16, 32, 64}; also probe pinning topology (LB float vs `LB_PIN_CPU=3`; APIs 0/1 vs 0/2 — a pin that tanks p99 reveals HT siblings). These are env-only on the clean image (no rebuild) and can't be tuned on WSL. Pick the best.
 3. **Out-ASM the per-request overhead** (the #1 is ASM for a reason): the remaining gap to 0.353 is per-request *runtime/loop* overhead, not CPU math. Rewrite the API hot path as a **C-static or ASM `FROM scratch`** epoll+EPIOCSPARAMS reactor (the existing Rust epoll_server.rs is the spec; port it). Goal: match/exceed the top-1's syscall sequence + flat-array fd state (no HashMap), pre-rendered responses (already have), zero per-request allocation. This is the credible path from ~0.35 → ~0.32.
 4. **Micro-loop opts** (measure each on target, they're below WSL noise): flat-array fd state vs HashMap; `recv`/`send` with `MSG_DONTWAIT` tight loop; re-arm QUICKACK timing; epoll vs edge-triggered; minimize the LB→API handoff cost (it's per-connection — ensure keep-alive dominates).
 5. **Warm-up depth**: the forked LB self-warm primes NAT/BPU/TLB; tune `LB_SELF_WARM` count; ensure `/ready` only flips after warm.

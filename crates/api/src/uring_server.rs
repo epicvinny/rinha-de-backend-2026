@@ -21,7 +21,7 @@ use std::time::Instant;
 
 use io_uring::types::BufRingEntry;
 use io_uring::{cqueue, opcode, types, IoUring};
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 
 use crate::{
     handoff_response_for_bucket, parse_handoff_request, score_body, score_body_fast_bucket,
@@ -153,8 +153,13 @@ fn tune_client_fd(fd: RawFd) {
     }
 }
 
+/// Gate for per-request `TCP_QUICKACK` re-arm. Default OFF (see epoll_server:
+/// the extra per-read setsockopt regressed p99 on the target). `API_QUICKACK_REARM=1`
+/// to enable.
+static REARM_QUICKACK: AtomicBool = AtomicBool::new(false);
+
 /// Re-arm one-shot TCP_QUICKACK after each request so the response ACK isn't
-/// delayed (perf-handoff-learnings: QUICKACK is worth ~1.2ms here).
+/// delayed. Only called when `REARM_QUICKACK` is set.
 #[inline]
 fn set_quickack(fd: RawFd) {
     unsafe {
@@ -246,6 +251,7 @@ fn compact(conn: &mut Conn, consumed: usize) {
 }
 
 pub fn run(listen: String, state: AppState) -> io::Result<()> {
+    REARM_QUICKACK.store(env_u32("API_QUICKACK_REARM", 0) != 0, Ordering::Relaxed);
     if std::env::var("API_URING_MULTISHOT").ok().as_deref() == Some("1") {
         return run_multishot(listen, state);
     }
@@ -390,7 +396,9 @@ fn on_recv(
         conn.recv_armed = false;
         if res > 0 {
             conn.len += res as usize;
-            set_quickack(fd);
+            if REARM_QUICKACK.load(Ordering::Relaxed) {
+                set_quickack(fd);
+            }
             advance(ring, fd, conn, state)?;
             return Ok(());
         }
@@ -694,7 +702,9 @@ fn on_recv_multi(
                 conn.len += take;
                 unsafe { pool.publish(b) }; // recycle AFTER copying out
             }
-            set_quickack(fd);
+            if REARM_QUICKACK.load(Ordering::Relaxed) {
+                set_quickack(fd);
+            }
             advance_multi(ring, fd, conn, state)?;
         } else if res == -libc::ENOBUFS {
             // pool momentarily exhausted; re-arm below.
