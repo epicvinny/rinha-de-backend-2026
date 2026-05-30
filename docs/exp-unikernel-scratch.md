@@ -1,246 +1,180 @@
-# Experimento: OS/Kernel do Zero — Análise de Opções
+# Experimento: Runtime "do Zero" para a Rinha — Análise Corrigida
+
+> **Revisão 2026-05-29.** A versão anterior deste documento recomendava a **Opção D
+> (io_uring + `IORING_REGISTER_NAPI`)** com a premissa de que "io_uring é o que diferencia
+> o top-1". Essa premissa foi **refutada** por uma análise direta do código-fonte dos três
+> repositórios de referência (clonados e auditados, incluindo branches). O top-1 **não usa
+> io_uring** — usa **epoll + `EPIOCSPARAMS` (NAPI busy-poll)**. Este documento foi reescrito
+> com base nas evidências verificadas.
 
 ## Contexto
 
-**Competição:** Rinha de Backend 2026 — Fraud Detection via Vector Search  
-**Objetivo:** p99 < 0.30ms no ambiente oficial (Mac Mini Late 2014, 2.6GHz Haswell, Ubuntu 24.04)  
-**Nosso baseline:** 0.966ms (blocking workers, Rust + C LB, FD-handoff)  
-**Top-1 (ASM):** 0.366ms — usa syscalls diretas, zero libc, io_uring  
+**Competição:** Rinha de Backend 2026 — Fraud Detection via Vector Search
+**Métrica:** p99 de latência por requisição única (warm). Menor é melhor.
+**Objetivo:** bater o top-1.
+**Ambiente oficial:** Mac Mini Late 2014, 2.6GHz Haswell, Ubuntu 24.04.
+**Nosso baseline:** 0.966ms (na época da análise; tokio + threads bloqueantes + C LB FD-handoff).
+**Top-1 (ASM):** 0.366ms.
 
-**Restrições do Docker:**
-- Containers COMPARTILHAM o kernel do HOST — não é possível trocar o kernel
-- cpuset não funciona no CI da Rinha (HostConfig não mostra CpusetCpus)
-- `privileged: false` obrigatório
-- Bridge networking (sem host mode)
-- 1.0 CPU total / 350MB total — split 0.20 LB + 0.40+0.40 API
+**Restrições do Docker (inalteradas):**
+- Containers COMPARTILHAM o kernel do HOST — não dá para trocar o kernel.
+- `privileged: false` obrigatório.
+- Bridge networking (sem host mode).
+- 1.0 CPU total / 350MB total.
 
-**O que "OS do zero" significa no contexto Docker:**
-- `FROM scratch` na runtime image (zero userspace, só o binário)
-- Binário estático (sem .so, sem glibc overhead, sem dynamic linker)
-- Syscalls diretas (sem wrapper de libc, sem overhead de trampolim)
-- Alocação de memória controlada (sem malloc heap por default)
-
-## Arquitetura atual (referência)
-
-```
-[k6 client]
-    ↓ TCP :9999
-[fd_handoff_lb.c — C, glibc, accepts TCP, round-robin]
-    ↓ Unix domain socket (SCM_RIGHTS sendmsg)
-[api — Rust+tokio, 120 threads bloqueantes, tree_only classifier]
-    ↓ HTTP response
-[k6 client]
-```
-
-**Hot path por request:**
-1. LB: accept4() + setsockopt(NODELAY) + sendmsg(SCM_RIGHTS) + close() → ~3µs CPU
-2. API: recv_fd → read() → parse HTTP → classify (tree, 1039 nós) → write() → ~5µs CPU
-3. Scheduler wakeup latency → ~200-300µs (o dominator do p99)
+**O que "do zero" significa aqui:** não é trocar o kernel (impossível sob Docker). É:
+`FROM scratch` + binário estático + syscalls diretas + uso das features de busy-poll do
+kernel. O top-1 em ASM é exatamente isso.
 
 ---
 
-## Opção A — FROM scratch + C estático (musl, sem libc)
+## Achados verificados dos três concorrentes
 
-**Descrição:** Reescrever o servidor API em C com musl-libc estático. Manter a separação LB+API. Compilar com `-static -Os -march=haswell`. Usar `FROM scratch` na runtime image.
+Teardown direto do código (não dos READMEs). Resumo:
 
-**O que muda vs baseline:**
-- Remove glibc (8MB → 0) e debian runtime (~100MB → 0)
-- Substitui musl (~500KB static) como único userspace
-- Elimina dynamic linker overhead (~5-10µs no cold start, irrelevante no warm)
-- Binário menor → melhor I-cache fit
-- Sem Rust runtime (tokio event loop, mimalloc, etc.)
+| Solução | p99 | Modelo de I/O | Busy-poll | Linguagem / runtime |
+|---|---|---|---|---|
+| **ASM (top-1)** | **0.366ms** | **epoll** — os syscalls `io_uring_*` estão *definidos mas nunca invocados*; o README engana | **`EPIOCSPARAMS`** 50µs / budget 8 + `SO_BUSY_POLL` | NASM, `FROM scratch`, sem libc |
+| **C++ (#2)** | 0.41ms | epoll | `EPIOCSPARAMS` 50µs / budget 8 | C++23, `-Ofast -march=haswell -flto` |
+| **Rust (#3)** | 0.46ms | epoll | **nenhum** (`epoll_wait(-1)`) | Rust + LB em C |
 
-**Implementação:**
-```c
-// api_server.c — C puro, musl-static
-#include <unistd.h>
-#include <sys/socket.h>
-#include <sys/un.h>
-// ... sem stdio, sem malloc heap
-// Todos os buffers em stack ou bss
+### Conclusão central (corrigida)
 
-// O árore de decisão (1039 nós) vira array de C structs
-typedef struct { int feature; float threshold; int left; int right; float value; } Node;
-static const Node TREE[1039] = { /* gerado de tree_model.rs */ };
+1. **O diferencial de latência é NAPI busy-poll via `EPIOCSPARAMS`, não io_uring.** As duas
+   soluções mais rápidas usam busy-poll; a mais lenta (Rust) não usa e paga ~26% a mais.
+   Os três usam a *mesma* arquitetura LB(SCM_RIGHTS)+2 API epoll e o *mesmo* índice
+   i16/AVX2 — a variável que separa 0.366/0.41 de 0.46 é o busy-poll.
 
-// classify: ~1µs, sem alocação
-static int classify(float* vec) { ... }
-```
+2. **`EPIOCSPARAMS` é uma feature de kernel ≥ 6.9.** Verificado em fontes primárias
+   ([man7 ioctl_eventpoll](https://www.man7.org/linux/man-pages/man2/ioctl_eventpoll.2.html),
+   série Joe Damato/Fastly, [Phoronix Linux 6.9](https://www.phoronix.com/news/Linux-6.9-IO_uring)).
+   Ubuntu 24.04 GA/.1 = kernel 6.8; 24.04.2+ (HWE) = 6.11/6.14. Como **dois** top solutions
+   dependem de `EPIOCSPARAMS`, o **host oficial da Rinha roda ≥ 6.9** — isso deixou de ser
+   especulação e virou evidência derivada de submissões que funcionam.
 
-**Dockerfile:**
-```dockerfile
-FROM alpine AS builder
-RUN apk add musl-dev gcc
-COPY crates/api/src/api_server.c .
-RUN gcc -static -Os -march=haswell -fomit-frame-pointer -DNDEBUG \
-    -o api_server api_server.c
+3. **Sem necessidade de `CAP_NET_ADMIN`.** Ambos usam `busy_poll_budget = 8`, abaixo do teto
+   `NAPI_POLL_WEIGHT` (64). Logo o busy-poll funciona sob `privileged: false`.
 
-FROM scratch
-COPY --from=builder /api_server /api_server
-CMD ["/api_server"]
-```
-
-**Ganho esperado:** 20-50µs por request (I-cache, sem Rust runtime overhead).  
-**Complexidade:** Média — precisa portar o tree_model.rs para C (1039 nós, geração de código).  
-**Risco:** Baixo — semântica idêntica ao código Rust atual.
+4. **io_uring é o caminho NÃO explorado** — ninguém no top usou. Isso o torna uma **aposta
+   legítima para ir abaixo de 0.366ms**, mas é uma hipótese com risco, não "copiar o vencedor".
 
 ---
 
-## Opção B — FROM scratch + ASM puro x86-64 (NASM)
+## Ingredientes comprovados (presentes no código vencedor)
 
-**Descrição:** Reescrever tudo em NASM x86-64 com syscalls diretas (sem libc alguma). Exatamente o que o top-1 faz. Binário de ~20-50KB.
+Além do busy-poll, o top-1 combina:
 
-**Vantagens vs Opção A:**
-- Zero overhead de chamadas de função (inline tudo com macros)
-- Controle total sobre registradores (dados críticos em xmm/ymm registers)
-- `SYSCALL` direto (sem errno, sem trampolim de libc, sem PLT)
-- Binário menor → cabe inteiro em L1 I-cache (~32KB)
-- Para a árvore de decisão: comparações com `vcomiss`/`jg` sem framework
-
-**Exemplo do hot path em ASM:**
-```nasm
-; fast_classify(vec_ptr rdi) → bucket rax
-; Inline do loop da árvore, sem call overhead
-fast_classify:
-    lea  rsi, [TREE_NODES]    ; tabela de nós em .rodata
-    xor  ecx, ecx             ; node_idx = 0
-.loop:
-    mov  eax, [rsi + rcx*NODESIZE + feature_offset]
-    test eax, eax
-    js   .leaf                ; idx < 0 → folha
-    vmovss xmm0, [rdi + rax*4]      ; vec[feature]
-    vcomiss xmm0, [rsi + rcx*NODESIZE + threshold_offset]
-    jbe  .go_left
-    mov  ecx, [rsi + rcx*NODESIZE + right_offset]
-    jmp  .loop
-.go_left:
-    mov  ecx, [rsi + rcx*NODESIZE + left_offset]
-    jmp  .loop
-.leaf:
-    ; eax = value (bucket)
-    ret
-```
-
-**Dockerfile:**
-```dockerfile
-FROM ubuntu:24.04 AS builder
-RUN apt-get install -y nasm binutils
-COPY asm/ .
-RUN nasm -f elf64 server.asm -o server.o && \
-    ld -static -o server server.o   # sem libc, só syscalls
-
-FROM scratch
-COPY --from=builder /server /server
-CMD ["/server"]
-```
-
-**Ganho esperado:** 50-100µs vs Opção A. Total vs baseline: potencialmente 200-300µs.  
-**Complexidade:** Alta — semanas de trabalho para implementação correta.  
-**Risco:** Alto — debug complexo, sem ferramentas de debugging habituais.
+- **`EPIOCSPARAMS` (epoll) + `SO_BUSY_POLL`/`SO_PREFER_BUSY_POLL`/`SO_BUSY_POLL_BUDGET` (socket)**
+  com **fallback gracioso**: o ioctl que falha (ENOTTY em kernel < 6.9) é ignorado e cai para
+  `epoll_wait(timeout=1ms)`. Nunca falha o boot.
+- **TCP**: `TCP_DEFER_ACCEPT`, `TCP_QUICKACK` (re-armado por conexão), `TCP_NODELAY`,
+  `TCP_FASTOPEN`.
+- **LB FD-handoff via `SCM_RIGHTS`** (round-robin), sem proxy de bytes.
+- **`cpuset` pinning** no docker-compose (`"0"`, `"1"`, `"2,3"`) — ver contradição abaixo.
+- **Warm-up agressivo**: 10k buscas sintéticas + um **filho `fork()`ado que dispara
+  requisições de volta através do LB**, primando o caminho NAT/docker-proxy/SCM_RIGHTS/BPU/TLB
+  *antes* do k6 começar.
+- **Respostas pré-renderizadas** em `.rodata` (6 buckets de fraud_score).
+- **Quantização i16 (×10000) + scan AVX2** com `vpmaddwd`; **acumuladores dual-chain** (divide
+  os 7 pares em duas cadeias para cortar a dependência de `vpaddd`); **quantização FMA-fundida**
+  (`vfmadd213sd`).
+- **Roteamento por partição**: 4 índices IVF por tag `(unknown_merchant, has_last_tx)`;
+  varre só 1/4 dos vetores. Mais um *fast-path* heurístico (thresholds) e um *repair pattern*
+  para casos ambíguos (0 mismatches).
+- **`mmap` + `mlock` + `madvise(MADV_HUGEPAGE | MADV_WILLNEED)` + `MAP_POPULATE`** no índice.
 
 ---
 
-## Opção C — Processo único sem LB (tudo em C/ASM)
+## Estado atual do nosso baseline (gap analysis)
 
-**Descrição:** Eliminar completamente a separação LB+API. Um único processo escuta em :9999, usa epoll ou io_uring, e processa todas as conexões internamente. Não há Unix domain sockets, não há SCM_RIGHTS, não há overhead de IPC.
+Auditoria de `crates/` em 2026-05-29.
 
-**Mudança arquitetural:**
-```
-[k6 client]
-    ↓ TCP :9999
-[único processo — escuta + classifica + responde]
-    (usa threads internas ou epoll single-thread para "2 instâncias")
-```
+**Já feito ✅** (reusar sem mexer):
+- Quantização **i16** (`crates/shared/src/quantize.rs`, scale 10000, sentinela -10000) +
+  **distância L2 AVX2** `madd_epi16` (`crates/shared/src/distance.rs`). *(Nota: `CLAUDE.md`
+  ainda diz "FP32 slab" — drift de documentação; o código já é i16.)*
+- **Respostas pré-renderizadas** (6 buckets, `crates/api/src/main.rs:122`).
+- **LB FD-handoff SCM_RIGHTS round-robin** em C (`crates/lb/fd_handoff_lb.c`).
+- **`mmap`** sempre + **`mlock`** opcional (`MLOCK_INDEX=1`, `crates/api/src/main.rs:1027`).
+- **Warm-up por toque** de memória antes do `/ready` (`crates/api/src/search.rs:303`).
+- **Flags de build agressivas** (`lto="fat"`, `codegen-units=1`, `panic="abort"`,
+  `target-cpu=haswell +avx2,+fma`).
+- `TCP_NODELAY`, `TCP_QUICKACK` em ambos os caminhos.
 
-**Por que eliminar o LB?**
-- SCM_RIGHTS sendmsg tem overhead: ~1-2µs por conexão
-- Unix domain socket tem overhead: write + read no kernel
-- Com processo único, a conexão vai direto do accept() ao classify()
-- Economiza 2 syscalls + 1 context switch por request
-
-**Problema:** A regra da Rinha exige "pelo menos 1 load balancer + 2 instâncias da API em round-robin". Um processo único não cumpre isso.
-
-**Workaround:** 2 binários (api1 e api2) + 1 LB "vazio" que só faz accept+close (sem handoff). Mas aí a API precisa escutar TCP diretamente, perdendo o FD-handoff.
-
-**OU:** 1 processo que escuta :9999 E internamente divide o work em 2 threads pinadas → simula 2 instâncias. O LB "fake" é um terceiro processo que simplesmente recusa conexões (e as APIs escutam com SO_REUSEPORT). Mas isso viola a semântica de round-robin.
-
-**Conclusão:** Opção C viola as regras ou requer workarounds arriscados.
-
----
-
-## Opção D — io_uring + C estático (MAIS PROMISSORA para vencer o top-1)
-
-**Descrição:** Reescrever o servidor API usando io_uring em vez de epoll. C estático com musl. `FROM scratch`. Esta é exatamente a diferença entre o top-1 (0.366ms, io_uring) e o 2º lugar Rust (0.46ms, epoll).
-
-**Por que io_uring é diferente:**
-- `epoll_wait` + `read` + `write` = 3 syscalls por request cycle
-- `io_uring`: batch de operações + 1 syscall (ou ZERO com SQPOLL)
-- `IORING_SETUP_SINGLE_ISSUER | DEFER_TASKRUN`: reduz context switches
-- `IORING_SETUP_SQPOLL`: kernel polling thread — ZERO syscalls do userspace
-- `IORING_REGISTER_NAPI` + `IORING_FEAT_FAST_POLL`: busy-poll via io_uring (NÃO precisa de EPIOCSPARAMS kernel 6.9!)
-
-**O IORING_REGISTER_NAPI é a chave:**
-- Registra NAPI polling no io_uring ring
-- Funciona com qualquer kernel ≥ 5.19 (não precisa de 6.9!)
-- Não usa cpuset — usa o NAPI do io_uring diretamente
-- É EXATAMENTE o que o top-1 usa: "IORING_REGISTER_NAPI"
-
-**Implementação:**
-```c
-struct io_uring ring;
-struct io_uring_params params = {
-    .flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN
-};
-io_uring_queue_init_params(256, &ring, &params);
-
-// Registrar NAPI busy-poll (NÃO precisa de kernel 6.9!)
-struct io_uring_napi napi = { .busy_poll_to = 50, .prefer_busy_poll = 1 };
-io_uring_register_napi(&ring, &napi);  // IORING_REGISTER_NAPI
-
-// Multishot accept — aceita N conexões com 1 syscall
-io_uring_prep_multishot_accept(sqe, server_fd, NULL, NULL, SOCK_CLOEXEC);
-
-// Provided buffers — zero-copy receive
-io_uring_register_pbuf_ring(&ring, ...);  // IORING_REGISTER_PBUF_RING
-```
-
-**Ganho esperado:** 200-400µs vs baseline epoll. Potencialmente alcança 0.4-0.5ms.  
-**Complexidade:** Alta mas bem documentada (liburing existe para C).  
-**Risco:** Médio — io_uring bem suportado em Ubuntu 24.04 (kernel 6.8).  
-**Relação com Rust:** pode ser escrito em C com liburing, ou Rust com tokio-uring/rio.
+**Faltando ❌** (o trabalho real):
+- **epoll + `EPIOCSPARAMS` busy-poll** — o hot path da API é **tokio + thread bloqueante por
+  FD**, sem loop epoll e sem busy-poll. **Este é o maior lever** (é exatamente o que separa
+  0.46 de 0.366).
+- **`cpuset` / afinidade de CPU** (ausente no compose).
+- **`MADV_HUGEPAGE` / `MAP_POPULATE`** no mmap.
+- **Self-warm `fork()`ado através do LB** (só existe o warm-up por toque).
+- **`TCP_DEFER_ACCEPT`, `TCP_FASTOPEN`, `SO_BUSY_POLL`**.
 
 ---
 
-## Comparação e recomendação
+## Contradições a verificar
 
-| Opção | Ganho estimado | Complexidade | Risco | Alinha com top-1? |
-|-------|----------------|--------------|-------|-------------------|
-| A — C+musl FROM scratch | 20-50µs | Média | Baixo | Parcialmente |
-| B — ASM puro | 50-150µs | Alta | Alto | Sim (é o top-1) |
-| C — Processo único | 10-20µs | Média | Alto (regras) | Não |
-| **D — io_uring + C** | **200-400µs** | Alta | Médio | **Sim (diferencial do top-1)** |
+1. **cpuset.** `CLAUDE.md` afirma "cpuset não funciona no CI da Rinha (HostConfig não mostra
+   CpusetCpus)". Mas o `docker-compose.yml` do top-1 **pina `cpuset: "0"/"1"/"2,3"`**. Ou o
+   ambiente oficial honra `cpuset` (mesmo que o CI report não exponha), ou o top-1 depende de
+   algo silenciosamente ignorado. **Ação:** adicionar `cpuset` no compose E um fallback
+   in-process via `sched_setaffinity` (que funciona dentro do conjunto de CPUs permitido pelo
+   cgroup mesmo sem `cpuset`), e medir os dois.
 
-**Recomendação:** Opção D (io_uring) tem o maior potencial de ganho real e é o que diferencia o top-1 do resto. O `IORING_REGISTER_NAPI` funciona sem kernel 6.9 e sem cpuset — é o busy-poll "que funciona".
-
-**Caminho combinado ótimo:**
-1. Opção A (C+musl FROM scratch) como base — elimina overhead de Rust runtime
-2. Opção D (io_uring) sobre a base C — elimina overhead de syscalls
-3. Se tempo permitir: Opção B (ASM) para o tight inner loop
+2. **FP32 vs i16.** `CLAUDE.md` e a versão antiga deste doc dizem "FP32 slab"; o código já usa
+   i16. Corrigir o `CLAUDE.md`.
 
 ---
 
-## Arquivos existentes de referência
+## Reavaliação das 4 opções originais
 
-- `crates/api/src/tree_model.rs` — árvore de decisão (1039 nós) para portar para C
-- `crates/api/src/classifier.rs` — lógica de classify_approved
-- `crates/lb/fd_handoff_lb.c` — LB atual em C (referência de socket setup)
-- `crates/api/src/main.rs` — hot path Rust atual (linhas 556-646)
-- `temporary-results/research/rinha_zig/` — referência de outra solução minimal
+| Opção | Veredito corrigido |
+|---|---|
+| **A — C/musl `FROM scratch`** | É uma escolha de *runtime*. O ganho vem do busy-poll + índice, não da linguagem. → micro-opt tardio, não estratégia. |
+| **B — ASM puro** | O que o top-1 usa para o runtime, mas seu ganho também é o busy-poll + índice + warm-up, não o ASM em si. → micro-opt de último estágio. |
+| **C — processo único sem LB** | Continua violando as regras. Descartado. |
+| **D — io_uring + NAPI** | **Rebaixada** de "a resposta" para "a aposta especulativa para bater o top-1", **condicionada a primeiro empatar o piso** (epoll+EPIOCSPARAMS). io_uring ≥6.9 (`IORING_REGISTER_NAPI`) + SQPOLL + multishot + provided buffers pode cortar syscalls abaixo do epoll, mas ninguém comprovou isso nesta carga (1 req/conexão). |
+
+---
+
+## Recomendação: empatar o piso primeiro, medir, depois decidir
+
+Caminho de menor risco para ir abaixo de 0.366ms (estágios; cada um com gate em
+**0 5xx**, **0 mismatches no oracle**, **vectorizer byte-equal builder/api**, **p99 warm medido**):
+
+- **Estágio 0 — Verificar ambiente.** Probe de boot do kernel e disponibilidade de
+  `EPIOCSPARAMS`; `cpuset` no compose + fallback `sched_setaffinity`.
+- **Estágio 1 — O lever: epoll + `EPIOCSPARAMS` busy-poll no hot path da API** (substituir o
+  handler bloqueante por um loop epoll por worker; novo `crates/api/src/epoll_server.rs`).
+  Só muda a camada de I/O — o scoring permanece byte-idêntico.
+- **Estágio 2 — Busy-poll + tuning de socket no LB** (`fd_handoff_lb.c`).
+- **Estágio 3 — `MADV_HUGEPAGE`/`MAP_POPULATE` + `mlock` default + `cpuset`.**
+- **Estágio 4 — Self-warm `fork()`ado através do LB.**
+- **Estágio 5 — Empacotamento musl-static + `FROM scratch`.**
+- **Estágio 6 — Medir p99 por estágio e decidir.** Só depois de empatar o piso abrir um
+  *branch de experimento* para a aposta io_uring (Opção D) ou para micro-opts de compute
+  (dual-chain AVX2, quantização FMA, roteamento por partição) — o que os dados indicarem.
+
+---
+
+## Arquivos de referência
+
+- `crates/shared/src/{quantize,distance,vectorize}.rs` — quantização i16, distância AVX2, vectorizer canônico (reusar).
+- `crates/api/src/main.rs` — hot path FD-handoff atual (a substituir por epoll); mmap do índice (~linha 1027).
+- `crates/api/src/search.rs` — warm-up (~linha 303), engines de busca.
+- `crates/api/src/{classifier,tree_model}.rs` — classificador (tree-only 1039 nós) / scoring.
+- `crates/lb/fd_handoff_lb.c` — LB FD-handoff (untracked; comitar ao tunar).
+- `docker-compose.yml`, `Dockerfile` — limites de recurso / empacotamento.
+- `test/{smoke,test}.js` — k6 (0 5xx + p99).
+
+## Concorrentes (clonados em `D:\rinha-competitors\`, fora do repo público)
+
+- Top-1 ASM: https://github.com/vinicius-piassa/rinha-backend-2026-asm
+- C++ (0.41ms, `EPIOCSPARAMS`): https://github.com/dalvorsn/cpp-rinha-backend-2026
+- Rust (0.46ms, epoll sem busy-poll): https://github.com/rafaelcoelhox/detecta-fraude
 
 ## Recursos externos
 
-- Top-1 ASM repo: https://github.com/vinicius-piassa/rinha-backend-2026-asm
-- Rust competitor (0.46ms, usa io_uring+NAPI): https://github.com/rafaelcoelhox/detecta-fraude
-- C++ competitor (0.41ms, usa EPIOCSPARAMS): https://github.com/dalvorsn/cpp-rinha-backend-2026
+- `EPIOCSPARAMS` / epoll busy-poll (kernel ≥ 6.9): https://www.man7.org/linux/man-pages/man2/ioctl_eventpoll.2.html
+- io_uring NAPI (`IORING_REGISTER_NAPI`, kernel ≥ 6.9): https://www.phoronix.com/news/Linux-6.9-IO_uring
 - liburing: https://github.com/axboe/liburing
-- io_uring NAPI: `IORING_REGISTER_NAPI` in linux/io_uring.h (kernel ≥ 5.19)

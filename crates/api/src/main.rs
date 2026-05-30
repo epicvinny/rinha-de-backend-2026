@@ -32,6 +32,8 @@ use tokio::net::{TcpListener, TcpStream};
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod classifier;
+#[cfg(target_os = "linux")]
+mod epoll_server;
 mod perf;
 mod search;
 mod tree_model;
@@ -369,6 +371,13 @@ async fn handle_raw_connection(mut stream: TcpStream, state: AppState) -> io::Re
 
 #[cfg(unix)]
 fn run_fd_handoff_server(listen: String, state: AppState) -> io::Result<()> {
+    // Default to the single-threaded epoll + EPIOCSPARAMS busy-poll reactor on
+    // Linux (set API_FD_EPOLL=0 to revert to the blocking-thread model for A/B).
+    #[cfg(target_os = "linux")]
+    if std::env::var("API_FD_EPOLL").ok().as_deref() != Some("0") {
+        return epoll_server::run(listen, state);
+    }
+
     let path = listen.strip_prefix("unix:").unwrap_or(&listen).to_string();
     let _ = fs::remove_file(&path);
     let listener = UnixListener::bind(&path)?;
@@ -390,6 +399,29 @@ fn run_fd_handoff_server(listen: String, state: AppState) -> io::Result<()> {
     }
 
     Ok(())
+}
+
+// Synthetic payloads for startup warm-up: one falls through to the decision
+// tree (the hot path), one hits the fast-path approve branch.
+#[cfg(unix)]
+const WARM_PAYLOADS: [&[u8]; 2] = [
+    br#"{"id":"warm-tree","transaction":{"amount":1500.00,"installments":4,"requested_at":"2026-03-11T20:23:35Z"},"customer":{"avg_amount":769.76,"tx_count_24h":4,"known_merchants":["MERC-009"]},"merchant":{"id":"MERC-001","mcc":"5999","avg_amount":298.95},"terminal":{"is_online":true,"card_present":false,"km_from_home":80.5},"last_transaction":{"timestamp":"2026-03-11T14:58:35Z","km_from_current":18.86}}"#,
+    br#"{"id":"warm-fast","transaction":{"amount":41.12,"installments":2,"requested_at":"2026-03-11T18:45:53Z"},"customer":{"avg_amount":82.24,"tx_count_24h":3,"known_merchants":["MERC-003","MERC-016"]},"merchant":{"id":"MERC-016","mcc":"5411","avg_amount":60.25},"terminal":{"is_online":false,"card_present":true,"km_from_home":29.23},"last_transaction":null}"#,
+];
+
+/// Prime the classify hot path (BPU / I-cache / TLB) before serving. Cheap
+/// (tree eval is ~ns); gated by API_WARM_ITERS (0 disables).
+#[cfg(unix)]
+fn warm_classifier(iters: usize) {
+    let mut acc = 0u64;
+    for _ in 0..iters {
+        for payload in WARM_PAYLOADS.iter() {
+            if let Some(approved) = classifier::classify_approved(payload) {
+                acc = acc.wrapping_add(approved as u64);
+            }
+        }
+    }
+    std::hint::black_box(acc);
 }
 
 #[cfg(unix)]
@@ -985,7 +1017,7 @@ fn main() {
         && perf.is_none()
         && !log_search_avg
     {
-        let ready = Arc::new(AtomicBool::new(true));
+        let ready = Arc::new(AtomicBool::new(false));
         let state = AppState {
             index: None,
             constants: Arc::new(shared::Constants::load_embedded()),
@@ -1006,6 +1038,16 @@ fn main() {
             })
             .expect("failed to spawn minimal ready server");
 
+        let warm_iters = std::env::var("API_WARM_ITERS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(50_000);
+        if warm_iters > 0 {
+            eprintln!("Warming classifier hot path ({} iters)...", warm_iters);
+            warm_classifier(warm_iters);
+        }
+        ready.store(true, Ordering::Relaxed);
+
         eprintln!("Classifier-only handoff API ready on port {}", port);
         run_fd_handoff_server(fd_listen.unwrap(), state)
             .expect("fd handoff server exited with error");
@@ -1024,21 +1066,31 @@ fn main() {
         } else {
             eprintln!("Loading index from {}...", index_path);
             let file = File::open(&index_path).expect("failed to open index.bin");
-            let mmap = unsafe { MmapOptions::new().map(&file).expect("failed to mmap index") };
+            // MAP_POPULATE faults the index in at map time so the hot path never
+            // takes a minor fault on first touch.
+            let mmap = unsafe {
+                MmapOptions::new()
+                    .populate()
+                    .map(&file)
+                    .expect("failed to mmap index")
+            };
 
             #[cfg(unix)]
-            if std::env::var("MLOCK_INDEX").ok().as_deref() == Some("1") {
-                unsafe {
-                    let ptr = mmap.as_ptr() as *const libc::c_void;
-                    let len = mmap.len();
-                    if libc::mlock(ptr, len) == 0 {
-                        eprintln!(
-                            "Successfully locked index memory of size {} bytes in RAM via mlock.",
-                            len
-                        );
+            unsafe {
+                let ptr = mmap.as_ptr() as *mut libc::c_void;
+                let len = mmap.len();
+                // Transparent huge pages + prefetch hint for the index region
+                // (reduces TLB pressure on the scan). Best-effort.
+                let _ = libc::madvise(ptr, len, libc::MADV_HUGEPAGE);
+                let _ = libc::madvise(ptr, len, libc::MADV_WILLNEED);
+                // mlock by default (compose sets memlock ulimit unlimited); set
+                // MLOCK_INDEX=0 to opt out.
+                if std::env::var("MLOCK_INDEX").ok().as_deref() != Some("0") {
+                    if libc::mlock(ptr as *const libc::c_void, len) == 0 {
+                        eprintln!("Locked index ({} bytes) in RAM via mlock.", len);
                     } else {
                         let err = std::io::Error::last_os_error();
-                        eprintln!("Warning: Failed to lock index memory in RAM: {}. Performance under memory pressure may degrade.", err);
+                        eprintln!("Warning: mlock failed: {}. Degraded under memory pressure.", err);
                     }
                 }
             }

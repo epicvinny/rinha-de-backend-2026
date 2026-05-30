@@ -1,10 +1,14 @@
 services:
   lb:
+    # Winning topology: C FD-handoff LB (fastest local, mirrors the competitors'
+    # SCM_RIGHTS round-robin). The C LB reads BACKENDS (unix socket paths)
+    # directly; UPSTREAM_PROTOCOL/POOL are Rust-LB-only and ignored here.
+    command: ["/opt/fd_handoff_lb"]
+    cpuset: "2,3"
     environment:
       - BACKENDS=unix:/sockets/api1-fd.sock,unix:/sockets/api2-fd.sock
-      - UPSTREAM_PROTOCOL=handoff
-      - UPSTREAM_POOL_PER_BACKEND=32
-      - UPSTREAM_PRECONNECT_PER_BACKEND=32
+      # Forked self-warm: prime accept->handoff->classify path before real load.
+      - LB_SELF_WARM=2000
     volumes:
       - backend-sockets:/sockets
     security_opt:
@@ -20,9 +24,18 @@ services:
           memory: "30MB"
 
   api1:
+    cpuset: "0"
     environment:
       - API_FD_LISTEN=/sockets/api1-fd.sock
       - API_PARSER=fast
+      - API_CLASSIFIER=tree_only
+      # epoll + EPIOCSPARAMS NAPI busy-poll (kernel >= 6.9; falls back gracefully).
+      - API_FD_EPOLL=1
+      - API_BUSY_POLL_US=50
+      - API_BUSY_POLL_BUDGET=8
+      - API_PREFER_BUSY_POLL=1
+      # In-process affinity fallback (effective even if compose cpuset is ignored).
+      - API_PIN_CPU=0
     volumes:
       - backend-sockets:/sockets
     security_opt:
@@ -31,6 +44,9 @@ services:
       nofile:
         soft: 65535
         hard: 65535
+      memlock:
+        soft: -1
+        hard: -1
     deploy:
       resources:
         limits:
@@ -38,9 +54,16 @@ services:
           memory: "160MB"
 
   api2:
+    cpuset: "1"
     environment:
       - API_FD_LISTEN=/sockets/api2-fd.sock
       - API_PARSER=fast
+      - API_CLASSIFIER=tree_only
+      - API_FD_EPOLL=1
+      - API_BUSY_POLL_US=50
+      - API_BUSY_POLL_BUDGET=8
+      - API_PREFER_BUSY_POLL=1
+      - API_PIN_CPU=1
     volumes:
       - backend-sockets:/sockets
     security_opt:
@@ -49,6 +72,9 @@ services:
       nofile:
         soft: 65535
         hard: 65535
+      memlock:
+        soft: -1
+        hard: -1
     deploy:
       resources:
         limits:

@@ -238,6 +238,8 @@ static int handoff(int idx, int client_fd) {
 static void tune_client_socket(int fd) {
     int one = 1;
     (void)setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    /* Skip the delayed-ACK timer on the first response (re-armed per accept). */
+    (void)setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK, &one, sizeof(one));
 }
 
 static int listen_tcp(int port) {
@@ -247,6 +249,13 @@ static int listen_tcp(int port) {
     int one = 1;
     (void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
     (void)setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
+    /* Only wake accept() once the request bytes have arrived: the fd we hand
+       off to the API already has data ready, saving a wakeup round-trip. */
+    int defer = 1;
+    (void)setsockopt(fd, IPPROTO_TCP, TCP_DEFER_ACCEPT, &defer, sizeof(defer));
+    /* Server-side TCP Fast Open queue. */
+    int tfo_qlen = 256;
+    (void)setsockopt(fd, IPPROTO_TCP, TCP_FASTOPEN, &tfo_qlen, sizeof(tfo_qlen));
 
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
@@ -270,8 +279,46 @@ static int listen_port(void) {
     return 9999;
 }
 
+/* Forked self-warm: drive synthetic requests through our own listen port so the
+   accept -> SCM_RIGHTS handoff -> API classify -> response path (and the API's
+   branch predictor / I-cache) is hot before the real load arrives. Best-effort;
+   Connection: close so each request completes and the socket drains cleanly. */
+static void self_warm(int port, int count) {
+    static const char* BODY =
+        "{\"id\":\"warm\",\"transaction\":{\"amount\":384.88,\"installments\":3,"
+        "\"requested_at\":\"2026-03-11T20:23:35Z\"},\"customer\":{\"avg_amount\":769.76,"
+        "\"tx_count_24h\":3,\"known_merchants\":[\"MERC-001\"]},\"merchant\":{\"id\":"
+        "\"MERC-001\",\"mcc\":\"5912\",\"avg_amount\":298.95},\"terminal\":{\"is_online\":"
+        "false,\"card_present\":true,\"km_from_home\":13.7},\"last_transaction\":{"
+        "\"timestamp\":\"2026-03-11T14:58:35Z\",\"km_from_current\":18.8}}";
+    char req[1024];
+    int rlen = snprintf(req, sizeof(req),
+        "POST /fraud-score HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n"
+        "Connection: close\r\nContent-Length: %d\r\n\r\n%s",
+        (int)strlen(BODY), BODY);
+    if (rlen <= 0 || rlen >= (int)sizeof(req)) return;
+
+    for (int i = 0; i < count; ++i) {
+        int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (fd < 0) continue;
+        struct sockaddr_in addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons((uint16_t)port);
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        if (connect(fd, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
+            (void)send(fd, req, (size_t)rlen, MSG_NOSIGNAL);
+            char buf[512];
+            ssize_t r;
+            do { r = recv(fd, buf, sizeof(buf), 0); } while (r > 0);
+        }
+        close(fd);
+    }
+}
+
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
+    signal(SIGCHLD, SIG_IGN); /* auto-reap the self-warm child */
     parse_upstreams();
     connect_all();
 
@@ -279,6 +326,17 @@ int main(void) {
     if (server_fd < 0) {
         perror("listen");
         return 1;
+    }
+
+    int warm = 0;
+    const char* warm_env = getenv("LB_SELF_WARM");
+    if (warm_env != NULL && warm_env[0] != '\0') warm = atoi(warm_env);
+    if (warm > 0) {
+        pid_t child = fork();
+        if (child == 0) {
+            self_warm(listen_port(), warm);
+            _exit(0);
+        }
     }
 
     for (;;) {
