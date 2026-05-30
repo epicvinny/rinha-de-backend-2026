@@ -31,7 +31,13 @@
   one-time QUICKACK in `tune_client_fd` stays. **LB pin to be dropped via compose**
   (`LB_PIN_CPU` removed → LB floats). This returns to the #7376 baseline config.
 - **No preview test filed for this revert** (user decision — re-banking the known-good
-  0.387 config doesn't need a test). Clean image + compose prepared for the next sweep batch.
+  0.387 config doesn't need a test).
+- **Clean baseline image BUILT + PUSHED + fresh-pull verified:**
+  `visuzano/rinha-2026:epoll-clean-ec97581` (digest `sha256:c3351fac…`, single manifest,
+  no attestation). Contains BOTH `/opt/api` (Rust baseline, QUICKACK off) and
+  `/opt/api_c_reactor`. Fresh-pull confirmed `/opt` binaries intact; both paths smoke-tested
+  in-container (LB + 2× api, bridge, tmpfs): keep-alive + churn = 0 5xx, correct buckets,
+  /ready 200. **Not submitted** — submission branch still @ `9225b7a` (uring-dfd89b3).
 - **Next:** front-load the cheap env-only sweeps (busy-poll + pinning topology), then the
   C-static reactor rewrite. See `docs/perf-bottlenecks.md` and the session plan.
 
@@ -50,9 +56,11 @@
   JSON fields in an order the positional `parse_fast_fields` rejects → Err on every request,
   IDENTICALLY on the Rust api and the C reactor. Use `check_classifier` (correct field order)
   for scoring correctness and a keep-alive HTTP stress for 0-5xx; not `validate`.
-- **Remaining before any test:** `docker build` the image (confirm `/opt/api_c_reactor` in the
-  container) + run `docker-compose.handoff.yml` with `command:[/opt/api_c_reactor]` locally.
-  Then the C-reactor preview test is gated on the env-sweep results (per the session plan).
+- **Container gates CLOSED (2026-05-30):** the image builds in bookworm (reactor.c compiles),
+  `/opt/api_c_reactor` is present + dynamically linked, and an in-container compose run
+  (LB + 2× `command:[/opt/api_c_reactor]`) passed keep-alive 20000 + churn 3000 = 0 5xx.
+  Image = `visuzano/rinha-2026:epoll-clean-ec97581`. The C-reactor preview test remains gated
+  on the env-sweep results (per the session plan); nothing is submitted yet.
 
 
 ## TL;DR
