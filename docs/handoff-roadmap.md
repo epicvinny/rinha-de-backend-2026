@@ -1,5 +1,23 @@
 # Handoff & roadmap — Rinha 2026 (as of 2026-05-30)
 
+## ►► START HERE (exact starting point for the next session) ◄◄
+- **Branch (local, source — never pushed to a public repo):** `codex/epoll-frontier`
+  at commit **`855f588`** (created off `codex/exp-io-uring`; contains the epoll
+  reactor + QUICKACK-rearm + LB-pin + all docs; the io_uring code is present but
+  SHELVED — do not use it).
+- **Live submission image (Docker Hub, single-arch manifest.v2):**
+  **`visuzano/rinha-2026:uring-dfd89b3`** — built from commit `dfd89b3` (ancestor of
+  `855f588`; the only delta from `855f588` is this handoff doc). On the next image
+  rebuild, retag to `epoll-<shortsha>` for clarity (io_uring is dead — the tag name
+  is legacy).
+- **Live submission branch (registered repo `epicvinny/rinha-de-backend-2026-epicvinny`):**
+  `submission` @ **`9225b7a`** → epoll + QUICKACK-rearm + LB-pin, image
+  `uring-dfd89b3`, NO seccomp. This is the current preview entry (#7385).
+- **Local submission compose under test:** `C:\Users\visuz\rinha-submission\docker-compose.yml`.
+- **Read first:** this file, then `CLAUDE.md` (submission procedure + 10/day test
+  tracker + dead ends), `docs/perf-bottlenecks.md`, `docs/exp-unikernel-scratch.md`.
+
+
 ## TL;DR
 - We went from broken to **4th place, p99 0.387ms, perfect score** (0 FP/FN, 0 5xx).
 - Topology: **C `fd_handoff_lb` (SCM_RIGHTS round-robin) + 2× API epoll reactor + EPIOCSPARAMS NAPI busy-poll + `tree_only` classifier.**
