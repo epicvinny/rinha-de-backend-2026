@@ -31,14 +31,16 @@ use tokio::net::{TcpListener, TcpStream};
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-mod classifier;
+// Classifier + decision tree now live in the `scorer` crate (single source of
+// truth shared with the C epoll reactor via FFI). Alias so existing
+// `classifier::classify_approved(..)` call sites are unchanged.
+use scorer::classifier;
 #[cfg(target_os = "linux")]
 mod epoll_server;
 #[cfg(target_os = "linux")]
 mod uring_server;
 mod perf;
 mod search;
-mod tree_model;
 use search::Index;
 
 #[derive(Clone)]

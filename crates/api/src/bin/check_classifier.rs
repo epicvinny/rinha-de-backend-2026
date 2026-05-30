@@ -1,7 +1,4 @@
-#[path = "../classifier.rs"]
-mod classifier;
-#[path = "../tree_model.rs"]
-mod tree_model;
+use scorer::classifier;
 
 use serde::Deserialize;
 use shared::types::Payload;

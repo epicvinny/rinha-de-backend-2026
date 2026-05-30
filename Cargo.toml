@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/shared",
+    "crates/scorer",
     "crates/oracle",
     "crates/builder",
     "crates/api",

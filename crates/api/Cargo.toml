@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 shared = { path = "../shared" }
+scorer = { path = "../scorer" }
 axum = { version = "0.7", features = ["json"] }
 tokio = { version = "1", features = ["io-util", "macros", "rt"] }
 serde = { version = "1", features = ["derive"] }

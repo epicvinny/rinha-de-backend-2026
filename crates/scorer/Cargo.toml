@@ -1,0 +1,14 @@
+[package]
+name = "scorer"
+version = "0.1.0"
+edition = "2021"
+
+# `rlib` so the Rust `api` crate can depend on it (single source of truth for the
+# classifier); `staticlib` so the C epoll reactor can link `libscorer.a` and call
+# `rinha_score_body` via FFI. Release profile is `panic = "abort"` (workspace
+# Cargo.toml), so the extern "C" boundary cannot unwind.
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+shared = { path = "../shared" }
