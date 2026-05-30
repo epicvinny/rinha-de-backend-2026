@@ -279,6 +279,101 @@ enum Outcome {
     Close,
 }
 
+/// Per-stage I/O instrumentation for the winning tree_only+epoll path (which the
+/// PerfCollector does not cover). Gated by API_IO_TRACE=1; zero overhead when
+/// off (no Instant::now calls). Measures the CPU cost of each request stage so
+/// we can see how little of warm-p99 is CPU vs I/O/wakeup latency.
+struct IoTrace {
+    enabled: bool,
+    every: usize,
+    read_ns: Vec<u64>,
+    score_ns: Vec<u64>,
+    write_ns: Vec<u64>,
+}
+
+impl IoTrace {
+    fn from_env() -> Self {
+        let enabled = std::env::var("API_IO_TRACE").ok().as_deref() == Some("1");
+        let every = std::env::var("API_IO_TRACE_EVERY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(50_000)
+            .max(1);
+        if enabled {
+            eprintln!("API_IO_TRACE on: per-stage read/score/write ns, summary every {}", every);
+        }
+        IoTrace {
+            enabled,
+            every,
+            read_ns: Vec::new(),
+            score_ns: Vec::new(),
+            write_ns: Vec::new(),
+        }
+    }
+
+    #[inline]
+    fn on(&self) -> bool {
+        self.enabled
+    }
+
+    #[inline]
+    fn push_read(&mut self, ns: u64) {
+        if self.enabled {
+            self.read_ns.push(ns);
+        }
+    }
+
+    #[inline]
+    fn push_score(&mut self, ns: u64) {
+        if self.enabled {
+            self.score_ns.push(ns);
+        }
+    }
+
+    #[inline]
+    fn push_write(&mut self, ns: u64) {
+        if self.enabled {
+            self.write_ns.push(ns);
+            if self.score_ns.len() >= self.every {
+                self.flush();
+            }
+        }
+    }
+
+    fn flush(&mut self) {
+        eprintln!(
+            "{{\"kind\":\"io_trace\",\"samples\":{},\"read_ns\":{},\"score_ns\":{},\"write_ns\":{}}}",
+            self.score_ns.len(),
+            stat(&self.read_ns),
+            stat(&self.score_ns),
+            stat(&self.write_ns),
+        );
+        self.read_ns.clear();
+        self.score_ns.clear();
+        self.write_ns.clear();
+    }
+}
+
+fn stat(values: &[u64]) -> String {
+    if values.is_empty() {
+        return "{\"p50\":0,\"p99\":0,\"max\":0,\"avg\":0.0}".to_string();
+    }
+    let mut v = values.to_vec();
+    v.sort_unstable();
+    let pct = |p: usize| -> u64 {
+        let idx = ((v.len() - 1) * p).div_ceil(100);
+        v[idx]
+    };
+    let sum: u128 = v.iter().map(|&x| x as u128).sum();
+    format!(
+        "{{\"p50\":{},\"p99\":{},\"max\":{},\"avg\":{:.1}}}",
+        pct(50),
+        pct(99),
+        v[v.len() - 1],
+        sum as f64 / v.len() as f64
+    )
+}
+
 /// Compute the response for a fully-buffered request, mirroring the blocking
 /// handler in `main.rs` exactly (same perf/parser/classifier branching).
 fn process_request(
@@ -314,7 +409,13 @@ fn process_request(
 /// `Some(Outcome)` when the caller should stop (connection closing, or a write
 /// went pending and we now wait on EPOLLOUT); `None` when the buffer is drained
 /// and more socket data is needed.
-fn process_buffered(epfd: RawFd, fd: RawFd, conn: &mut Conn, state: &AppState) -> Option<Outcome> {
+fn process_buffered(
+    epfd: RawFd,
+    fd: RawFd,
+    conn: &mut Conn,
+    state: &AppState,
+    trace: &mut IoTrace,
+) -> Option<Outcome> {
     loop {
         if conn.len == 0 {
             return None;
@@ -329,10 +430,19 @@ fn process_buffered(epfd: RawFd, fd: RawFd, conn: &mut Conn, state: &AppState) -
             }
             Ok(Some(req)) => {
                 let body = &conn.buf[req.header_len..req.total_len];
+                let t_score = if trace.on() { Some(Instant::now()) } else { None };
                 let resp = process_request(state, body, req.route);
+                if let Some(t) = t_score {
+                    trace.push_score(t.elapsed().as_nanos() as u64);
+                }
                 let total_len = req.total_len;
                 let close = req.close_after_response;
-                match try_write(fd, resp, 0) {
+                let t_write = if trace.on() { Some(Instant::now()) } else { None };
+                let write_state = try_write(fd, resp, 0);
+                if let Some(t) = t_write {
+                    trace.push_write(t.elapsed().as_nanos() as u64);
+                }
+                match write_state {
                     WriteState::Done => {
                         compact(conn, total_len);
                         if close {
@@ -373,7 +483,7 @@ fn compact(conn: &mut Conn, consumed: usize) {
 }
 
 /// Drive one connection in response to an epoll event (EPOLLIN/EPOLLOUT).
-fn drive(epfd: RawFd, fd: RawFd, conn: &mut Conn, state: &AppState) -> Outcome {
+fn drive(epfd: RawFd, fd: RawFd, conn: &mut Conn, state: &AppState, trace: &mut IoTrace) -> Outcome {
     // 1. Flush any pending write first.
     if let Some((data, off)) = conn.pending.take() {
         match try_write(fd, data, off) {
@@ -398,7 +508,7 @@ fn drive(epfd: RawFd, fd: RawFd, conn: &mut Conn, state: &AppState) -> Outcome {
 
     // 2. Process buffered requests, then read more, repeat until EAGAIN.
     loop {
-        if let Some(outcome) = process_buffered(epfd, fd, conn, state) {
+        if let Some(outcome) = process_buffered(epfd, fd, conn, state, trace) {
             return outcome;
         }
         // Buffer drained; read more from the socket.
@@ -407,6 +517,7 @@ fn drive(epfd: RawFd, fd: RawFd, conn: &mut Conn, state: &AppState) -> Outcome {
             // Full buffer with no complete request was handled in process_buffered.
             return Outcome::Close;
         }
+        let t_read = if trace.on() { Some(Instant::now()) } else { None };
         let n = unsafe {
             let dst = conn.buf.as_mut_ptr().add(conn.len);
             libc::read(fd, dst.cast(), cap - conn.len)
@@ -415,6 +526,9 @@ fn drive(epfd: RawFd, fd: RawFd, conn: &mut Conn, state: &AppState) -> Outcome {
             return Outcome::Close;
         }
         if n > 0 {
+            if let Some(t) = t_read {
+                trace.push_read(t.elapsed().as_nanos() as u64);
+            }
             conn.len += n as usize;
             continue;
         }
@@ -454,6 +568,7 @@ pub fn run(listen: String, state: AppState) -> io::Result<()> {
 
     let mut control: HashSet<RawFd> = HashSet::new();
     let mut conns: HashMap<RawFd, Conn> = HashMap::new();
+    let mut io_trace = IoTrace::from_env();
 
     loop {
         let n = unsafe {
@@ -486,7 +601,7 @@ pub fn run(listen: String, state: AppState) -> io::Result<()> {
                 // EPOLLERR/EPOLLHUP without readable data -> read()/write() will
                 // surface the close; let drive() handle it.
                 let _ = flags;
-                match drive(epfd, fd, conn, &state) {
+                match drive(epfd, fd, conn, &state, &mut io_trace) {
                     Outcome::Keep => {}
                     Outcome::Close => {
                         epoll_del(epfd, fd);
