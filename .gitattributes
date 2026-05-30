@@ -1,0 +1,6 @@
+# Shell scripts MUST stay LF — they run on Linux (the GCP bench VM and WSL).
+# CRLF would break the shebang / cause `\r: command not found`.
+*.sh text eol=lf
+bench/** text eol=lf
+crates/lb/*.c text eol=lf
+crates/scorer/*.c text eol=lf
