@@ -1,0 +1,134 @@
+# Rinha de Backend 2026 — BEST submission config (versioned copy; the live copy
+# lives in the registered repo's `submission` branch = compose + info.json only).
+#
+# Measured: p99 0.3647ms, score 6000 (perfect detection, 0 5xx) — preview #7396,
+# submission commit 285ee52. This is the winning config from the 2026-05-30 sweep
+# campaign (see docs/handoff-roadmap.md "Sweep campaign" section).
+#
+# Topology: C FD-handoff load balancer (SCM_RIGHTS round-robin) + 2 API instances
+# running the from-scratch C-static epoll reactor (/opt/api_c_reactor: EPIOCSPARAMS
+# NAPI busy-poll, flat fd state, no per-conn alloc) calling the Rust scorer via FFI
+# (byte-identical scoring to /opt/api). tree-only classifier.
+#
+# KEY TUNING (campaign findings):
+#   - CPU split LB 0.02 / API 0.49 x2 (=1.0): the APIs are quota-bound; the LB is
+#     idle after fd handoff. Max API quota = min p99 tail. (0.387 -> 0.365)
+#   - API_BUSY_POLL_US=50 is a hard optimum (25 -> 0.397, 100 -> 0.390).
+#   - 2 instances (the rule minimum); MORE would dilute per-API quota = worse.
+#   - LB unpinned (LB_PIN_CPU removed; pinning it onto an API HT-sibling regressed).
+# Image is prebuilt and public on Docker Hub. NO seccomp/privileged/caps (forbidden).
+services:
+  lb:
+    image: visuzano/rinha-2026:epoll-clean-ec97581
+    command: ["/opt/fd_handoff_lb"]
+    cpuset: "2,3"
+    ports:
+      - "9999:9999"
+    environment:
+      - LB_LISTEN=0.0.0.0:9999
+      - BACKENDS=unix:/sockets/api1-fd.sock,unix:/sockets/api2-fd.sock
+      - LB_SELF_WARM=2000
+    volumes:
+      - backend-sockets:/sockets
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    depends_on:
+      api1:
+        condition: service_healthy
+      api2:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "0.02"
+          memory: "30MB"
+    networks:
+      - rinha
+
+  api1:
+    image: visuzano/rinha-2026:epoll-clean-ec97581
+    command: ["/opt/api_c_reactor"]
+    cpuset: "0"
+    environment:
+      - PORT=8080
+      - API_FD_LISTEN=/sockets/api1-fd.sock
+      - API_PARSER=fast
+      - API_CLASSIFIER=tree_only
+      - API_FD_EPOLL=1
+      - API_BUSY_POLL_US=50
+      - API_BUSY_POLL_BUDGET=8
+      - API_PREFER_BUSY_POLL=1
+      - API_PIN_CPU=0
+    volumes:
+      - backend-sockets:/sockets
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+      memlock:
+        soft: -1
+        hard: -1
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/ready"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.49"
+          memory: "160MB"
+    networks:
+      - rinha
+
+  api2:
+    image: visuzano/rinha-2026:epoll-clean-ec97581
+    command: ["/opt/api_c_reactor"]
+    cpuset: "1"
+    environment:
+      - PORT=8080
+      - API_FD_LISTEN=/sockets/api2-fd.sock
+      - API_PARSER=fast
+      - API_CLASSIFIER=tree_only
+      - API_FD_EPOLL=1
+      - API_BUSY_POLL_US=50
+      - API_BUSY_POLL_BUDGET=8
+      - API_PREFER_BUSY_POLL=1
+      - API_PIN_CPU=1
+    volumes:
+      - backend-sockets:/sockets
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+      memlock:
+        soft: -1
+        hard: -1
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/ready"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.49"
+          memory: "160MB"
+    networks:
+      - rinha
+
+networks:
+  rinha:
+    driver: bridge
+
+volumes:
+  backend-sockets:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: size=4m,mode=0777

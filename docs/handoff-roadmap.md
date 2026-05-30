@@ -2,20 +2,57 @@
 
 ## ►► START HERE (exact starting point for the next session) ◄◄
 - **Branch (local, source — never pushed to a public repo):** `codex/epoll-frontier`
-  at commit **`855f588`** (created off `codex/exp-io-uring`; contains the epoll
-  reactor + QUICKACK-rearm + LB-pin + all docs; the io_uring code is present but
-  SHELVED — do not use it).
-- **Live submission image (Docker Hub, single-arch manifest.v2):**
-  **`visuzano/rinha-2026:uring-dfd89b3`** — built from commit `dfd89b3` (ancestor of
-  `855f588`; the only delta from `855f588` is this handoff doc). On the next image
-  rebuild, retag to `epoll-<shortsha>` for clarity (io_uring is dead — the tag name
-  is legacy).
+  (HEAD), fast-forward-merged into **`main`** locally (NOT pushed). Contains the
+  `scorer` crate + C reactor (`crates/scorer/reactor.c`) + QUICKACK gate + all docs +
+  `docker-compose.submission.yml` (the winning config, versioned).
+- **Live submission image (Docker Hub, single-arch, no attestation):**
+  **`visuzano/rinha-2026:epoll-clean-ec97581`** (digest `sha256:c3351fac…`) — contains
+  BOTH `/opt/api` (Rust baseline, QUICKACK off) and `/opt/api_c_reactor` (the C reactor).
 - **Live submission branch (registered repo `epicvinny/rinha-de-backend-2026-epicvinny`):**
-  `submission` @ **`9225b7a`** → epoll + QUICKACK-rearm + LB-pin, image
-  `uring-dfd89b3`, NO seccomp. This is the current preview entry (#7385).
-- **Local submission compose under test:** `C:\Users\visuz\rinha-submission\docker-compose.yml`.
+  `submission` @ **`285ee52`** → C reactor (`/opt/api_c_reactor`), LB 0.02 / API 0.49×2,
+  busy-poll US=50, NO seccomp = **p99 0.3647ms, score 6000** (preview #7396 — the campaign best).
+- **Local + versioned submission compose:** `C:\Users\visuz\rinha-submission\docker-compose.yml`
+  (live, plumbed to the submission branch) and `docker-compose.submission.yml` (versioned copy in this repo).
 - **Read first:** this file, then `CLAUDE.md` (submission procedure + 10/day test
   tracker + dead ends), `docs/perf-bottlenecks.md`, `docs/exp-unikernel-scratch.md`.
+
+## ★ Sweep campaign 2026-05-30 — p99 0.387 → 0.3647 (rank only; score was already maxed)
+
+**Scoring reality:** p99 ≤ 1ms saturates the p99 component at 3000 → we already hold the
+**maximum 6000**. Lowering p99 earns **zero points**; it only improves **leaderboard rank**
+(tiebreak among perfect-score entries). **0.20ms is infeasible** — it's below the world-best
+(0.353 hand-ASM) and every floor-breaking lever is rule-locked (verified from the engine's
+applied config: bridge enforced, no host net, `CapAdd:null`, no privileged, ≥2 instances + LB
+mandatory; io_uring needs forbidden seccomp). The realistic floor is ~0.33–0.35.
+
+**The reactor is NOT the lever** — three runs at the same floor: Rust epoll 0.387 (#7376),
+Rust+quickack+pin 0.403 (#7385), **C reactor 0.387 (#7393)**. The cost is external (bridge RTT
++ NAPI wakeup + scheduling on a shared 2C/4T box; k6 is co-located on `localhost:9999`).
+
+**Results (each = one preview test, one variable, on image `epoll-clean-ec97581`):**
+
+| # | Change (vs prior) | p99 (ms) | Verdict |
+|---|---|---|---|
+| 7393 | C reactor, LB 0.20 / API 0.40×2, US=50 | 0.3871 | baseline (= Rust) |
+| 7394 | LB 0.10 / API 0.45×2 | **0.3769** | −10µs ✅ |
+| 7395 | LB 0.05 / API 0.475×2 | **0.3682** | −9µs ✅ |
+| 7396 | LB 0.02 / API 0.49×2 | **0.3647** | −3µs ✅ (CPU lever flattens) → **BEST** |
+| 7397 | busy-poll US=25 | 0.3971 | +32µs ❌ |
+| 7398 | busy-poll US=100 | 0.3900 | +25µs ❌ |
+
+**Findings:**
+- **CPU allocation is the lever.** The APIs are quota-bound (CFS throttling under burst); the LB
+  is idle after the fd handoff. Shrinking the LB to its minimum (0.02) and maximizing per-API
+  quota (0.49 each) bought ~22µs. The curve flattens by 0.49 (near the quota ceiling).
+- **busy-poll US=50 is a hard optimum** (25 and 100 both regress 25–32µs). Leave it at 50.
+- **Keep 2 instances (the rule minimum)** — more would *dilute* per-API quota = worse. Do NOT add instances.
+- **LB unpinned** (dropping `LB_PIN_CPU`); pinning it onto an API HT-sibling regressed (#7385).
+- **Best config = `docker-compose.submission.yml` = submission `285ee52` = p99 0.3647ms, 6000.** Live now.
+
+**Remaining levers (next session, low probability, ~µs each — rank only):** busy-poll BUDGET
+{16,32,64} at US=50; pinning topology (APIs 0/2; LB pinned to a non-sibling); LB round-robin
+smoothing (repeat upstreams). The ~12µs gap to #1 (0.353) may be the ASM's per-instruction edge
+or run variance; the big config wins are already captured.
 
 ## ⚠️ UPDATE 2026-05-30 (later) — #7385 REGRESSED; reverted
 - **Preview #7385 came back at p99 0.4029ms — WORSE than #7376's 0.387ms** (perfect
@@ -37,7 +74,8 @@
   no attestation). Contains BOTH `/opt/api` (Rust baseline, QUICKACK off) and
   `/opt/api_c_reactor`. Fresh-pull confirmed `/opt` binaries intact; both paths smoke-tested
   in-container (LB + 2× api, bridge, tmpfs): keep-alive + churn = 0 5xx, correct buckets,
-  /ready 200. **Not submitted** — submission branch still @ `9225b7a` (uring-dfd89b3).
+  /ready 200. *(Superseded: this image was later submitted and tuned — see the Sweep campaign
+  section above; live submission is now `285ee52` at p99 0.3647ms.)*
 - **Next:** front-load the cheap env-only sweeps (busy-poll + pinning topology), then the
   C-static reactor rewrite. See `docs/perf-bottlenecks.md` and the session plan.
 
