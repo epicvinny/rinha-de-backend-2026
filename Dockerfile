@@ -18,8 +18,14 @@ COPY .cargo .cargo
 COPY crates crates
 
 ENV RUSTFLAGS="-C target-cpu=haswell -C target-feature=+avx2,+fma,+sse4.2"
-RUN cargo build --release -p builder -p api -p lb
+RUN cargo build --release -p builder -p api -p lb -p scorer
 RUN gcc -O3 -march=haswell -flto -DNDEBUG crates/lb/fd_handoff_lb.c -o /build/target/release/fd_handoff_lb
+# C-static epoll reactor (Track B): links libscorer.a (same Rust scoring as /opt/api)
+# and calls it over the C ABI. Dynamic link (no -static): the build image has no
+# glibc-static, and the PLT win is marginal. Selectable at runtime via the api
+# service command; /opt/api stays the safe fallback.
+RUN gcc -O3 -march=haswell -DNDEBUG crates/scorer/reactor.c /build/target/release/libscorer.a \
+    -lpthread -ldl -lm -o /build/target/release/api_c_reactor
 
 # Stage 2: Build index
 FROM --platform=linux/amd64 debian:bookworm-slim AS index-builder
@@ -46,6 +52,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=rust-builder /build/target/release/api /opt/api
+COPY --from=rust-builder /build/target/release/api_c_reactor /opt/api_c_reactor
 COPY --from=rust-builder /build/target/release/lb /opt/lb
 COPY --from=rust-builder /build/target/release/fd_handoff_lb /opt/fd_handoff_lb
 COPY --from=index-builder /data/index.bin /opt/index.bin
