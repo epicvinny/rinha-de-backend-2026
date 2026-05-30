@@ -153,6 +153,22 @@ fn tune_client_fd(fd: RawFd) {
     }
 }
 
+/// Re-arm one-shot TCP_QUICKACK after each request so the response ACK isn't
+/// delayed (perf-handoff-learnings: QUICKACK is worth ~1.2ms here).
+#[inline]
+fn set_quickack(fd: RawFd) {
+    unsafe {
+        let one: libc::c_int = 1;
+        let _ = libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_QUICKACK,
+            &one as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    }
+}
+
 /// Blocking-but-nonblocking-fd SCM_RIGHTS receive (control socket is O_NONBLOCK;
 /// returns Ok(Some(fd)) / Ok(None) on close / Err(EAGAIN) when drained).
 fn recv_fd(control_fd: RawFd) -> io::Result<Option<RawFd>> {
@@ -374,6 +390,7 @@ fn on_recv(
         conn.recv_armed = false;
         if res > 0 {
             conn.len += res as usize;
+            set_quickack(fd);
             advance(ring, fd, conn, state)?;
             return Ok(());
         }
@@ -677,6 +694,7 @@ fn on_recv_multi(
                 conn.len += take;
                 unsafe { pool.publish(b) }; // recycle AFTER copying out
             }
+            set_quickack(fd);
             advance_multi(ring, fd, conn, state)?;
         } else if res == -libc::ENOBUFS {
             // pool momentarily exhausted; re-arm below.

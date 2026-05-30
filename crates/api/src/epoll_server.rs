@@ -473,6 +473,20 @@ fn process_buffered(
     }
 }
 
+#[inline]
+fn set_quickack(fd: RawFd) {
+    unsafe {
+        let one: libc::c_int = 1;
+        let _ = libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_QUICKACK,
+            &one as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    }
+}
+
 fn compact(conn: &mut Conn, consumed: usize) {
     if consumed >= conn.len {
         conn.len = 0;
@@ -530,6 +544,10 @@ fn drive(epfd: RawFd, fd: RawFd, conn: &mut Conn, state: &AppState, trace: &mut 
                 trace.push_read(t.elapsed().as_nanos() as u64);
             }
             conn.len += n as usize;
+            // Re-arm QUICKACK (one-shot; kernel clears it after each ACK) so the
+            // response's ACK isn't delayed. perf-handoff-learnings: QUICKACK is
+            // worth ~1.2ms here.
+            set_quickack(fd);
             continue;
         }
         let err = io::Error::last_os_error();
