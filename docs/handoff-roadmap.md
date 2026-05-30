@@ -35,6 +35,25 @@
 - **Next:** front-load the cheap env-only sweeps (busy-poll + pinning topology), then the
   C-static reactor rewrite. See `docs/perf-bottlenecks.md` and the session plan.
 
+### Track B started (2026-05-30) — C-static reactor BUILT + validated, not yet container-built
+- **`crates/scorer`**: classifier+tree_model extracted into a `staticlib`+`rlib` crate
+  exporting `rinha_score_body(ptr,len)->u8` (0/5/255). The Rust `api` now depends on it
+  (single source of truth); behaviour unchanged.
+- **`crates/scorer/reactor.c`**: from-scratch C epoll reactor (flat fd→Conn* array + Conn
+  freelist, QUICKACK once, EPIOCSPARAMS busy-poll, SCM_RIGHTS, HTTP keep-alive, /ready TCP
+  thread) calling `rinha_score_body` via FFI. Dockerfile builds it to `/opt/api_c_reactor`
+  (dynamic link); `/opt/api` stays the fallback. A/B = one-line compose `command:` swap.
+- **Validated natively (no Docker, no preview test):** FFI==classify (3/3), check_classifier
+  0 mismatches over 54100, handoff smoke (approved/denied/400/ready), keep-alive 20000-req
+  stress = 20000×200 / 0 5xx, and **byte-equivalence to the Rust reactor**.
+- **⚠️ `validate` CANNOT test the tree_only+fast path:** its `build_request_json` serializes
+  JSON fields in an order the positional `parse_fast_fields` rejects → Err on every request,
+  IDENTICALLY on the Rust api and the C reactor. Use `check_classifier` (correct field order)
+  for scoring correctness and a keep-alive HTTP stress for 0-5xx; not `validate`.
+- **Remaining before any test:** `docker build` the image (confirm `/opt/api_c_reactor` in the
+  container) + run `docker-compose.handoff.yml` with `command:[/opt/api_c_reactor]` locally.
+  Then the C-reactor preview test is gated on the env-sweep results (per the session plan).
+
 
 ## TL;DR
 - We went from broken to **4th place, p99 0.387ms, perfect score** (0 FP/FN, 0 5xx).
