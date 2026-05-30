@@ -1,11 +1,15 @@
 use std::io;
 use std::net::SocketAddr;
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, RawFd};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc, Mutex,
 };
 use std::time::Instant;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+#[cfg(unix)]
+use tokio::net::UnixStream;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex as AsyncMutex, Semaphore, SemaphorePermit};
 
@@ -40,6 +44,7 @@ const SCORE_5_RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: application/j
 pub enum UpstreamProtocol {
     Http,
     Raw,
+    Handoff,
 }
 
 #[derive(Clone)]
@@ -53,37 +58,74 @@ pub struct LbConfig {
 }
 
 pub async fn run(config: LbConfig) -> io::Result<()> {
+    #[cfg(not(unix))]
+    if config.upstream_protocol == UpstreamProtocol::Handoff {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "fd handoff requires unix",
+        ));
+    }
+
     let listener = TcpListener::bind(config.listen).await?;
+    #[cfg(unix)]
+    let handoff_backends = if config.upstream_protocol == UpstreamProtocol::Handoff {
+        Some([
+            HandoffBackendPool::new(config.backends[0].clone(), config.upstream_pool_per_backend)?,
+            HandoffBackendPool::new(config.backends[1].clone(), config.upstream_pool_per_backend)?,
+        ])
+    } else {
+        None
+    };
     let state = Arc::new(LbState {
         backends: [
             BackendPool::new(config.backends[0].clone(), config.upstream_pool_per_backend),
             BackendPool::new(config.backends[1].clone(), config.upstream_pool_per_backend),
         ],
+        #[cfg(unix)]
+        handoff_backends,
         upstream_protocol: config.upstream_protocol,
         next_backend: AtomicU64::new(0),
         active_clients: AtomicU64::new(0),
         max_active_clients: AtomicU64::new(0),
         metrics: config.metrics,
     });
-    warm_backend_pools(&state, config.upstream_preconnect_per_backend).await;
+    if config.upstream_protocol == UpstreamProtocol::Handoff {
+        #[cfg(unix)]
+        warm_handoff_backend_pools(&state, config.upstream_preconnect_per_backend).await;
+    } else {
+        warm_backend_pools(&state, config.upstream_preconnect_per_backend).await;
+    }
 
     loop {
         let (stream, _) = listener.accept().await?;
         let accept_at = state.metrics.as_ref().map(|_| Instant::now());
         tune_socket(&stream);
         let state = Arc::clone(&state);
-        tokio::spawn(async move {
-            if let Err(err) = handle_client(stream, state, accept_at).await {
-                if err.kind() != io::ErrorKind::UnexpectedEof {
-                    eprintln!("lb client error: {}", err);
+        if state.upstream_protocol == UpstreamProtocol::Handoff {
+            #[cfg(unix)]
+            tokio::spawn(async move {
+                if let Err(err) = handle_handoff_client(stream, state, accept_at).await {
+                    if err.kind() != io::ErrorKind::UnexpectedEof {
+                        eprintln!("lb handoff client error: {}", err);
+                    }
                 }
-            }
-        });
+            });
+        } else {
+            tokio::spawn(async move {
+                if let Err(err) = handle_client(stream, state, accept_at).await {
+                    if err.kind() != io::ErrorKind::UnexpectedEof {
+                        eprintln!("lb client error: {}", err);
+                    }
+                }
+            });
+        }
     }
 }
 
 struct LbState {
     backends: [BackendPool; 2],
+    #[cfg(unix)]
+    handoff_backends: Option<[HandoffBackendPool; 2]>,
     upstream_protocol: UpstreamProtocol,
     next_backend: AtomicU64,
     active_clients: AtomicU64,
@@ -221,6 +263,107 @@ impl BackendPool {
     }
 }
 
+#[cfg(unix)]
+struct HandoffBackendPool {
+    path: String,
+    idle: AsyncMutex<Vec<UnixStream>>,
+    permits: Semaphore,
+    max_idle: usize,
+}
+
+#[cfg(unix)]
+impl HandoffBackendPool {
+    fn new(addr: String, max_connections: usize) -> io::Result<Self> {
+        let path = unix_backend_path(&addr)?;
+        Ok(Self {
+            path,
+            idle: AsyncMutex::new(Vec::with_capacity(max_connections)),
+            permits: Semaphore::new(max_connections),
+            max_idle: max_connections,
+        })
+    }
+
+    #[inline]
+    fn path(&self) -> &str {
+        &self.path
+    }
+
+    async fn take(
+        &self,
+        trace: &mut RequestTrace,
+        force_fresh: bool,
+    ) -> io::Result<(UnixStream, SemaphorePermit<'_>)> {
+        let permit_start = trace_instant(trace);
+        let permit =
+            self.permits.acquire().await.map_err(|_| {
+                io::Error::new(io::ErrorKind::ConnectionAborted, "handoff pool closed")
+            })?;
+        trace.pool_permit_wait_us += elapsed_optional_us(permit_start);
+
+        if !force_fresh {
+            let stream = {
+                let idle_lock_start = trace_instant(trace);
+                let mut idle = self.idle.lock().await;
+                trace.idle_lock_us += elapsed_optional_us(idle_lock_start);
+                idle.pop()
+            };
+            if let Some(stream) = stream {
+                trace.idle_hits += 1;
+                return Ok((stream, permit));
+            }
+            trace.idle_misses += 1;
+        } else {
+            let idle_lock_start = trace_instant(trace);
+            let mut idle = self.idle.lock().await;
+            trace.idle_lock_us += elapsed_optional_us(idle_lock_start);
+            idle.clear();
+            trace.idle_misses += 1;
+        }
+
+        let connect_start = trace_instant(trace);
+        let stream = UnixStream::connect(&self.path).await?;
+        trace.upstream_connect_us += elapsed_optional_us(connect_start);
+        Ok((stream, permit))
+    }
+
+    async fn put(&self, stream: UnixStream) {
+        let mut idle = self.idle.lock().await;
+        if idle.len() < self.max_idle {
+            idle.push(stream);
+        }
+    }
+
+    async fn warm(&self, target_idle: usize) -> io::Result<usize> {
+        let target_idle = target_idle.min(self.max_idle);
+        let mut connected = 0;
+        while self.idle.lock().await.len() < target_idle {
+            let start = Instant::now();
+            let stream = UnixStream::connect(&self.path).await?;
+            connected += 1;
+
+            let mut idle = self.idle.lock().await;
+            if idle.len() < target_idle {
+                idle.push(stream);
+            }
+
+            std::hint::black_box(elapsed_us(start));
+        }
+        Ok(connected)
+    }
+}
+
+#[cfg(unix)]
+fn unix_backend_path(addr: &str) -> io::Result<String> {
+    let path = addr.strip_prefix("unix:").unwrap_or(addr).trim();
+    if path.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "empty unix backend path",
+        ));
+    }
+    Ok(path.to_string())
+}
+
 async fn warm_backend_pools(state: &LbState, target_idle: usize) {
     if target_idle == 0 {
         return;
@@ -244,6 +387,220 @@ async fn warm_backend_pools(state: &LbState, target_idle: usize) {
                     err
                 );
             }
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn warm_handoff_backend_pools(state: &LbState, target_idle: usize) {
+    if target_idle == 0 {
+        return;
+    }
+
+    let Some(pools) = state.handoff_backends.as_ref() else {
+        return;
+    };
+
+    for (idx, pool) in pools.iter().enumerate() {
+        match pool.warm(target_idle).await {
+            Ok(connected) => {
+                eprintln!(
+                    "LB preconnected {} handoff sockets for backend{} ({})",
+                    connected,
+                    idx,
+                    pool.path()
+                );
+            }
+            Err(err) => {
+                eprintln!(
+                    "LB handoff preconnect skipped for backend{} ({}): {}",
+                    idx,
+                    pool.path(),
+                    err
+                );
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn handle_handoff_client(
+    client: TcpStream,
+    state: Arc<LbState>,
+    accept_at: Option<Instant>,
+) -> io::Result<()> {
+    let _client_guard = state.begin_client();
+    let trace_enabled = state.metrics.is_some();
+    let total_start = trace_enabled.then(Instant::now);
+    let request_id = state
+        .metrics
+        .as_ref()
+        .map(|metrics| metrics.next_request_id())
+        .unwrap_or(0);
+    let mut trace = RequestTrace {
+        enabled: trace_enabled,
+        request_id,
+        route: "handoff",
+        accept_to_read_us: if trace_enabled {
+            accept_at.map(elapsed_us).unwrap_or_default()
+        } else {
+            0
+        },
+        active_clients_at_start: if trace_enabled {
+            state.active_clients.load(Ordering::Relaxed)
+        } else {
+            0
+        },
+        max_active_clients_seen: if trace_enabled {
+            state.max_active_clients_seen()
+        } else {
+            0
+        },
+        ..RequestTrace::default()
+    };
+
+    let selected = state.choose_backend();
+    let client = client.into_std()?;
+    client.set_nonblocking(true)?;
+    let client_fd = client.as_raw_fd();
+
+    let status = match send_handoff_fd_with_retries(&state, selected, client_fd, &mut trace).await {
+        Ok(backend_idx) => {
+            trace.backend_idx = backend_idx as u8;
+            if backend_idx == 0 {
+                trace.backend0 = 1;
+            } else {
+                trace.backend1 = 1;
+            }
+            "ok"
+        }
+        Err(err) => {
+            trace.backend_idx = selected as u8;
+            trace.status_5xx = 1;
+            trace.reconnects += 1;
+            drop(client);
+            return Err(err);
+        }
+    };
+
+    trace.total_us = elapsed_optional_us(total_start);
+    if let Some(metrics) = state.metrics.as_ref() {
+        metrics.record(trace, status);
+    }
+
+    drop(client);
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn send_handoff_fd_with_retries(
+    state: &LbState,
+    selected: usize,
+    client_fd: RawFd,
+    trace: &mut RequestTrace,
+) -> io::Result<usize> {
+    let Some(pools) = state.handoff_backends.as_ref() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "handoff backends not configured",
+        ));
+    };
+    let attempts = [selected, selected, selected ^ 1];
+
+    for (attempt_idx, backend_idx) in attempts.into_iter().enumerate() {
+        if attempt_idx > 0 {
+            trace.retries += 1;
+        }
+
+        let pool = &pools[backend_idx];
+        let (stream, permit) = match pool.take(trace, attempt_idx > 0).await {
+            Ok(pair) => pair,
+            Err(_) => {
+                trace.reconnects += 1;
+                continue;
+            }
+        };
+
+        let send_start = trace_instant(trace);
+        let result = send_fd_async(&stream, client_fd).await;
+        trace.upstream_write_us += elapsed_optional_us(send_start);
+        trace.upstream_write_body_us = trace.upstream_write_us;
+
+        match result {
+            Ok(()) => {
+                pool.put(stream).await;
+                drop(permit);
+                return Ok(backend_idx);
+            }
+            Err(_) => {
+                trace.reconnects += 1;
+                drop(stream);
+                drop(permit);
+            }
+        }
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::ConnectionAborted,
+        "all handoff upstream attempts failed",
+    ))
+}
+
+#[cfg(unix)]
+async fn send_fd_async(stream: &UnixStream, fd: RawFd) -> io::Result<()> {
+    loop {
+        stream.writable().await?;
+        match send_fd_now(stream.as_raw_fd(), fd) {
+            Ok(()) => return Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => continue,
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn send_fd_now(sock_fd: RawFd, fd_to_send: RawFd) -> io::Result<()> {
+    let mut byte = [0u8; 1];
+    let mut iov = libc::iovec {
+        iov_base: byte.as_mut_ptr().cast(),
+        iov_len: byte.len(),
+    };
+    let mut control = [0u8; 64];
+
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.as_mut_ptr().cast();
+    msg.msg_controllen = control.len();
+
+    unsafe {
+        let cmsg = libc::CMSG_FIRSTHDR(&msg);
+        if cmsg.is_null() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "failed to allocate control message",
+            ));
+        }
+        (*cmsg).cmsg_level = libc::SOL_SOCKET;
+        (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<RawFd>() as _) as _;
+        std::ptr::copy_nonoverlapping(
+            &fd_to_send as *const RawFd as *const u8,
+            libc::CMSG_DATA(cmsg).cast::<u8>(),
+            std::mem::size_of::<RawFd>(),
+        );
+        msg.msg_controllen = libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as _) as _;
+
+        let sent = libc::sendmsg(sock_fd, &msg, libc::MSG_NOSIGNAL);
+        if sent == 1 {
+            Ok(())
+        } else if sent < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "short fd control message",
+            ))
         }
     }
 }
@@ -461,6 +818,10 @@ async fn forward_once(
         UpstreamProtocol::Raw => {
             forward_once_raw(upstream, backend_idx, request, body, response_buf, trace).await
         }
+        UpstreamProtocol::Handoff => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "handoff protocol bypasses request proxy",
+        )),
     }
 }
 

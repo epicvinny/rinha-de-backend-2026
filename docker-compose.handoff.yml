@@ -1,0 +1,64 @@
+services:
+  lb:
+    environment:
+      - BACKENDS=unix:/sockets/api1-fd.sock,unix:/sockets/api2-fd.sock
+      - UPSTREAM_PROTOCOL=handoff
+      - UPSTREAM_POOL_PER_BACKEND=32
+      - UPSTREAM_PRECONNECT_PER_BACKEND=32
+    volumes:
+      - backend-sockets:/sockets
+    security_opt:
+      - seccomp=unconfined
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    deploy:
+      resources:
+        limits:
+          cpus: "0.20"
+          memory: "30MB"
+
+  api1:
+    environment:
+      - API_FD_LISTEN=/sockets/api1-fd.sock
+      - API_PARSER=fast
+    volumes:
+      - backend-sockets:/sockets
+    security_opt:
+      - seccomp=unconfined
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    deploy:
+      resources:
+        limits:
+          cpus: "0.40"
+          memory: "160MB"
+
+  api2:
+    environment:
+      - API_FD_LISTEN=/sockets/api2-fd.sock
+      - API_PARSER=fast
+    volumes:
+      - backend-sockets:/sockets
+    security_opt:
+      - seccomp=unconfined
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    deploy:
+      resources:
+        limits:
+          cpus: "0.40"
+          memory: "160MB"
+
+volumes:
+  backend-sockets:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: size=4m,mode=0777

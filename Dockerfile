@@ -9,6 +9,7 @@ FROM --platform=linux/amd64 rust:1.89-slim-bookworm AS rust-builder
 WORKDIR /build
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
     pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
@@ -18,6 +19,7 @@ COPY crates crates
 
 ENV RUSTFLAGS="-C target-cpu=haswell -C target-feature=+avx2,+fma,+sse4.2"
 RUN cargo build --release -p builder -p api -p lb
+RUN gcc -O3 -march=haswell -flto -DNDEBUG crates/lb/fd_handoff_lb.c -o /build/target/release/fd_handoff_lb
 
 # Stage 2: Build index
 FROM --platform=linux/amd64 debian:bookworm-slim AS index-builder
@@ -45,6 +47,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=rust-builder /build/target/release/api /opt/api
 COPY --from=rust-builder /build/target/release/lb /opt/lb
+COPY --from=rust-builder /build/target/release/fd_handoff_lb /opt/fd_handoff_lb
 COPY --from=index-builder /data/index.bin /opt/index.bin
 
 ENV INDEX_PATH=/opt/index.bin

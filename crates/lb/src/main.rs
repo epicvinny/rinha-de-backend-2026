@@ -46,6 +46,7 @@ fn main() {
     {
         "http" => UpstreamProtocol::Http,
         "raw" => UpstreamProtocol::Raw,
+        "handoff" => UpstreamProtocol::Handoff,
         other => panic!("invalid UPSTREAM_PROTOCOL: {other}"),
     };
     let upstream_pool_per_backend = std::env::var("UPSTREAM_POOL_PER_BACKEND")
