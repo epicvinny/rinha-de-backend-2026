@@ -775,8 +775,11 @@ static void warm_classifier(uint32_t iters) {
 }
 
 /* ---- 3-tier epoll idle strategy ----------------------------------------
- * Phase 1: epoll_wait(0)  — non-blocking; also triggers NAPI busy-poll.
- * Phase 2: spin           — repeated epoll_wait(0)+PAUSE for g_epoll_spin_us µs.
+ * Phase 1+2: userspace spin — only when g_epoll_spin_us > 0. Calls epoll_wait(0)
+ *            repeatedly with PAUSE for up to g_epoll_spin_us µs.
+ *            WARNING: with EPIOCSPARAMS busy_poll_usecs > 0, each epoll_wait(0)
+ *            may trigger a full NAPI busy-poll cycle, burning g_busy_poll_us µs
+ *            per call. Only enable spin when EPIOCSPARAMS is disabled (us=0).
  * Phase 3: epoll_pwait2   — nanosecond-precision block for g_epoll_idle_us µs,
  *                           fallback to epoll_wait(fallback_ms) on ENOSYS.
  * When g_epoll_spin_us==0 and g_epoll_idle_us==0, equivalent to the old
@@ -785,12 +788,13 @@ static int epoll_wait_tiered(int epfd, struct epoll_event *evs, int maxev,
                               int fallback_ms) {
     int n;
 
-    /* Phase 1: non-blocking poll */
-    n = epoll_wait(epfd, evs, maxev, 0);
-    if (n != 0) return n;
-
-    /* Phase 2: userspace spin */
+    /* Phase 1+2: userspace spin (only when explicitly enabled AND NAPI off).
+     * Skipped by default (g_epoll_spin_us=0). */
     if (g_epoll_spin_us > 0) {
+        /* non-blocking probe first */
+        n = epoll_wait(epfd, evs, maxev, 0);
+        if (n != 0) return n;
+
         struct timespec t0, t1;
         clock_gettime(CLOCK_MONOTONIC, &t0);
         long end_ns = (long)t0.tv_sec * 1000000000L + t0.tv_nsec
@@ -804,7 +808,10 @@ static int epoll_wait_tiered(int epfd, struct epoll_event *evs, int maxev,
         }
     }
 
-    /* Phase 3: nanosecond-precision block */
+    /* Phase 3: nanosecond-precision block — replaces epoll_wait(1ms) with a
+     * tight g_epoll_idle_us µs timeout. The NAPI busy-poll (EPIOCSPARAMS) fires
+     * once inside this blocking call before sleeping, which is the intended path:
+     * one NAPI poll per request gap, not one per spin iteration. */
     if (g_epoll_idle_us > 0 && !g_pwait2_enosys) {
         struct timespec ts = { .tv_sec = 0,
                                .tv_nsec = (long)g_epoll_idle_us * 1000L };
