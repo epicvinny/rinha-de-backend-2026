@@ -32,10 +32,16 @@
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/un.h>
 #include <unistd.h>
+
+#ifndef PR_SET_TIMERSLACK
+#define PR_SET_TIMERSLACK 29
+#endif
 
 /* Provided by libscorer.a (crates/scorer/src/lib.rs).
  * Returns the response bucket: 0 approved / 5 denied / 255 parse error. */
@@ -125,6 +131,7 @@ static atomic_int g_ready = 0;
 
 /* ---- config (read once at startup) ---- */
 static int g_rearm_quickack = 0;
+static int g_single_recv = 0;     /* API_SINGLE_RECV: skip trailing EAGAIN read (default OFF) */
 static uint32_t g_busy_poll_us = 50;
 static uint32_t g_busy_poll_budget = 8;
 static uint32_t g_prefer_busy_poll = 1;
@@ -598,18 +605,38 @@ static int drive(int epfd, int fd, Conn *c) {
             c->want_out = 0;
         }
     }
-    /* 2. process buffered, then read more, repeat until EAGAIN */
+    /* 2. process buffered, then read more, repeat until EAGAIN.
+     *
+     * API_SINGLE_RECV optimisation: in closed-loop keepalive the client cannot
+     * send request N+1 until it receives response N, so after sending a response
+     * the socket is always empty — the trailing read() would always return EAGAIN,
+     * wasting a syscall.  When g_single_recv is set we skip that trailing read:
+     * after a successful read that returned fewer bytes than the space offered
+     * (socket is drained) we return OUT_KEEP and rely on level-triggered epoll
+     * + NAPI busy-poll to re-fire EPOLLIN when the next request arrives.
+     *
+     * Invariant (critical): did_read and last_read_partial are LOCAL to this
+     * drive() call, set only after a successful read() in this invocation.  We
+     * never consult a stale per-Conn flag.  A fresh drive() always performs the
+     * mandatory first read (did_read starts 0). */
+    int did_read = 0;
+    int last_read_partial = 0;
     for (;;) {
         int outcome = process_buffered(epfd, fd, c);
         if (outcome == OUT_CLOSE) return OUT_CLOSE;
         /* OUT_KEEP from process_buffered means "buffer drained / waiting"; read more */
         if (c->pending) return OUT_KEEP; /* a write went pending; wait on EPOLLOUT */
+        /* Skip trailing EAGAIN read when socket is already known-drained. */
+        if (g_single_recv && did_read && last_read_partial) return OUT_KEEP;
         size_t cap = HANDOFF_BUFFER_BYTES;
         if (c->len >= cap) return OUT_CLOSE;
-        ssize_t n = read(fd, c->buf + c->len, cap - c->len);
+        size_t space = cap - c->len;
+        ssize_t n = read(fd, c->buf + c->len, space);
         if (n == 0) return OUT_CLOSE;
         if (n > 0) {
             c->len += (size_t)n;
+            did_read = 1;
+            last_read_partial = ((size_t)n < space);
             if (g_rearm_quickack) set_quickack(fd);
             continue;
         }
@@ -750,7 +777,8 @@ int main(void) {
 
     int port = (int)env_u32("PORT", 8080);
     g_rearm_quickack = env_u32("API_QUICKACK_REARM", 0) != 0;
-    g_busy_poll_us = env_u32("API_BUSY_POLL_US", 50);
+    g_single_recv    = env_u32("API_SINGLE_RECV",    0) != 0;
+    g_busy_poll_us   = env_u32("API_BUSY_POLL_US",   50);
     g_busy_poll_budget = env_u32("API_BUSY_POLL_BUDGET", 8);
     g_prefer_busy_poll = env_u32("API_PREFER_BUSY_POLL", 1);
     uint32_t warm_iters = env_u32("API_WARM_ITERS", 50000);
@@ -773,6 +801,24 @@ int main(void) {
     }
 
     maybe_pin_cpu();
+
+    /* mlockall: pin all current pages into RAM, killing page-fault tail.
+     * Best-effort — silently fails inside non-privileged containers. */
+    if (mlockall(MCL_CURRENT) == 0)
+        fprintf(stderr, "mlockall(MCL_CURRENT): OK\n");
+    else
+        fprintf(stderr, "mlockall(MCL_CURRENT): %s (non-fatal)\n", strerror(errno));
+
+    /* PR_SET_TIMERSLACK=1ns: tighten the wake-jitter ceiling from the default
+     * 50µs.  No caps needed; always returns 0 on supported kernels. */
+    if (prctl(PR_SET_TIMERSLACK, 1, 0, 0, 0) == 0)
+        fprintf(stderr, "timerslack: set to 1 ns\n");
+    else
+        fprintf(stderr, "timerslack: prctl(%d) = %s (non-fatal)\n",
+                PR_SET_TIMERSLACK, strerror(errno));
+
+    fprintf(stderr, "single-recv optimisation: %s\n",
+            g_single_recv ? "on (API_SINGLE_RECV=1)" : "off (default)");
     fprintf(stderr, "per-request QUICKACK re-arm: %s\n",
             g_rearm_quickack ? "on" : "off (default)");
 

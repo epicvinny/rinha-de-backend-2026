@@ -61,6 +61,7 @@ services:
       - API_BUSY_POLL_BUDGET=8
       - API_PREFER_BUSY_POLL=1
       - API_PIN_CPU=0
+      - API_SINGLE_RECV=1
     volumes:
       - backend-sockets:/sockets
     ulimits:
@@ -98,6 +99,7 @@ services:
       - API_BUSY_POLL_BUDGET=8
       - API_PREFER_BUSY_POLL=1
       - API_PIN_CPU=1
+      - API_SINGLE_RECV=1
     volumes:
       - backend-sockets:/sockets
     ulimits:

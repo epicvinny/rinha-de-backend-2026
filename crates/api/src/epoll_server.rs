@@ -503,6 +503,14 @@ fn process_buffered(
 /// one-time QUICKACK set in `tune_client_fd` stays regardless.
 static REARM_QUICKACK: AtomicBool = AtomicBool::new(false);
 
+/// Skip the trailing EAGAIN read in closed-loop keepalive (API_SINGLE_RECV=1,
+/// default OFF). In k6 closed-loop the client cannot send request N+1 until it
+/// receives response N, so after writing a response the socket is always empty
+/// — the drain read() always returns EAGAIN, wasting a syscall. When enabled
+/// we return Outcome::Keep after the first partial read and let level-triggered
+/// epoll + NAPI busy-poll re-fire EPOLLIN when the next request arrives.
+static SINGLE_RECV: AtomicBool = AtomicBool::new(false);
+
 #[inline]
 fn set_quickack(fd: RawFd) {
     unsafe {
@@ -551,9 +559,26 @@ fn drive(epfd: RawFd, fd: RawFd, conn: &mut Conn, state: &AppState, trace: &mut 
     }
 
     // 2. Process buffered requests, then read more, repeat until EAGAIN.
+    //
+    // API_SINGLE_RECV optimisation: in closed-loop keepalive the client cannot
+    // send request N+1 until it receives response N, so after writing a response
+    // the socket is always empty — the trailing read() always returns EAGAIN,
+    // wasting a syscall. When enabled we skip that read: after a successful read
+    // that returned fewer bytes than the space offered (socket drained) we return
+    // Outcome::Keep and let LT-epoll + NAPI busy-poll re-fire EPOLLIN.
+    //
+    // Invariant: did_read / last_read_partial are LOCAL to this drive() call,
+    // set only after a successful read() in this invocation. A fresh drive()
+    // always performs the mandatory first read (did_read starts false).
+    let mut did_read = false;
+    let mut last_read_partial = false;
     loop {
         if let Some(outcome) = process_buffered(epfd, fd, conn, state, trace) {
             return outcome;
+        }
+        // Skip trailing EAGAIN read when socket is already known-drained.
+        if SINGLE_RECV.load(Ordering::Relaxed) && did_read && last_read_partial {
+            return Outcome::Keep;
         }
         // Buffer drained; read more from the socket.
         let cap = conn.buf.len();
@@ -561,10 +586,11 @@ fn drive(epfd: RawFd, fd: RawFd, conn: &mut Conn, state: &AppState, trace: &mut 
             // Full buffer with no complete request was handled in process_buffered.
             return Outcome::Close;
         }
+        let space = cap - conn.len;
         let t_read = if trace.on() { Some(Instant::now()) } else { None };
         let n = unsafe {
             let dst = conn.buf.as_mut_ptr().add(conn.len);
-            libc::read(fd, dst.cast(), cap - conn.len)
+            libc::read(fd, dst.cast(), space)
         };
         if n == 0 {
             return Outcome::Close;
@@ -574,6 +600,8 @@ fn drive(epfd: RawFd, fd: RawFd, conn: &mut Conn, state: &AppState, trace: &mut 
                 trace.push_read(t.elapsed().as_nanos() as u64);
             }
             conn.len += n as usize;
+            did_read = true;
+            last_read_partial = (n as usize) < space;
             // Re-arm QUICKACK so the response's ACK isn't delayed. Gated behind
             // API_QUICKACK_REARM (default OFF): on the target this extra per-read
             // setsockopt regressed p99 (preview #7385: 0.387 -> 0.403ms). The
@@ -609,6 +637,43 @@ pub fn run(listen: String, state: AppState) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     configure_busy_poll(epfd);
+
+    // mlockall: pin all current pages into RAM, eliminating page-fault tail.
+    // Best-effort — silently ignored in unprivileged containers that deny it.
+    // compose already sets memlock: -1 (unlimited) so the ulimit is lifted.
+    unsafe {
+        let rc = libc::mlockall(libc::MCL_CURRENT);
+        if rc == 0 {
+            eprintln!("mlockall(MCL_CURRENT): OK");
+        } else {
+            eprintln!(
+                "mlockall(MCL_CURRENT): {} (non-fatal)",
+                io::Error::last_os_error()
+            );
+        }
+    }
+
+    // PR_SET_TIMERSLACK=1ns: tighten wake-jitter ceiling from the default 50µs.
+    // No caps needed; prctl(29, ...) always succeeds on Linux >= 2.6.28.
+    unsafe {
+        const PR_SET_TIMERSLACK: libc::c_int = 29;
+        let rc = libc::prctl(PR_SET_TIMERSLACK, 1usize, 0usize, 0usize, 0usize);
+        if rc == 0 {
+            eprintln!("timerslack: set to 1 ns");
+        } else {
+            eprintln!(
+                "timerslack: prctl(29) = {} (non-fatal)",
+                io::Error::last_os_error()
+            );
+        }
+    }
+
+    let single_recv = env_u32("API_SINGLE_RECV", 0) != 0;
+    SINGLE_RECV.store(single_recv, Ordering::Relaxed);
+    eprintln!(
+        "single-recv optimisation: {}",
+        if single_recv { "on (API_SINGLE_RECV=1)" } else { "off (default)" }
+    );
 
     let rearm = env_u32("API_QUICKACK_REARM", 0) != 0;
     REARM_QUICKACK.store(rearm, Ordering::Relaxed);
