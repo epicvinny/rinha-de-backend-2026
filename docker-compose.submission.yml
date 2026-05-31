@@ -42,7 +42,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.02"
+          cpus: "0.20"
           memory: "30MB"
     networks:
       - rinha
@@ -61,7 +61,6 @@ services:
       - API_BUSY_POLL_BUDGET=8
       - API_PREFER_BUSY_POLL=1
       - API_PIN_CPU=0
-      - API_SINGLE_RECV=1
     volumes:
       - backend-sockets:/sockets
     ulimits:
@@ -80,7 +79,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.49"
+          cpus: "0.40"
           memory: "160MB"
     networks:
       - rinha
@@ -99,7 +98,6 @@ services:
       - API_BUSY_POLL_BUDGET=8
       - API_PREFER_BUSY_POLL=1
       - API_PIN_CPU=1
-      - API_SINGLE_RECV=1
     volumes:
       - backend-sockets:/sockets
     ulimits:
@@ -118,7 +116,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.49"
+          cpus: "0.40"
           memory: "160MB"
     networks:
       - rinha

@@ -1,76 +1,153 @@
-# Next-session prompt (paste this to start the next agent)
+# Next-session prompt (paste this para iniciar o próximo agente)
 
 ---
 
-You are continuing work on **Rinha de Backend 2026** (fraud-detection vector-search;
-scored on single-request **warm p99**, lower is better). Repo: `D:\Github\rinha-de-backend-2026`
-(public fork). Read `CLAUDE.md`, `docs/handoff-roadmap.md`, and `docs/gcp-bench-lab.md`
-FIRST — procedure, constraints, dead ends, test-budget tracker, and the GCP lab.
+Você está continuando o trabalho na **Rinha de Backend 2026** (fraud-detection; pontuado em **warm p99 single-request**, menor é melhor). Repo: `D:\Github\rinha-de-backend-2026` (fork público). Leia `CLAUDE.md` PRIMEIRO — tracker de previews, procedimentos, dead ends.
 
-## Start from (state after the 2026-05-31 GCP campaign)
-- **Local branch `codex/epoll-frontier` @ `06df365`** (adds the GCP bench-lab + an
-  env-gated `SO_INCOMING_CPU` lever, **default OFF**; io_uring code present but SHELVED).
-  Not pushed. NOTE: the repo working tree has a pre-existing CRLF↔LF churn — `git status`
-  shows the whole tree "modified"; stage only the specific files you change.
-- **Live submission (registered repo `epicvinny-sub` = epicvinny/rinha-de-backend-2026-epicvinny):**
-  `submission` branch @ **`285ee52`**, image **`visuzano/rinha-2026:epoll-clean-ec97581`**.
-  This is the banked best (C `fd_handoff_lb` + 2× C-reactor APIs, LB 0.02 / API 0.49×2,
-  busy 50/8/prefer1, pins 0/1, `tree_only`). **Do not destabilize it.**
+## Estado atual (2026-05-31, fim de sessão)
 
-## Where we are — read this carefully
-- **Best p99 = 0.3647ms** (preview #7396), perfect score 6000, 0 errors. Sits between
-  #2 (0.357) and #1 (0.353). BUT the same config re-tested at **0.3927ms** (#7555) →
-  **the preview environment has ~28µs run-to-run variance.**
-- **KEY CONCLUSION: the gap to #1 (~12µs) is SMALLER than the measurement noise (~28µs).**
-  It is **not reliably winnable by parameter tuning** — which run you draw matters more
-  than µs-level config changes. 0.3647 is the practical floor.
-- **Env knobs are exhausted.** The banked config is env-optimal and already at the
-  **1 CPU / 350 MB rule limit**. GCP sweep (2026-05-31) confirmed: budget/US/CPU-split all
-  within noise; only US>50 and PREFER=0 were clearly worse (so US≤50 + PREFER=1 are right).
-- **SO_INCOMING_CPU lever: tested and rejected.** Built (`incoming-06df365`), 0 5xx,
-  but #7553 = 0.3854ms (within noise, no gain) → **reverted** to 285ee52. Aligning RX
-  softirq with the reactor core does NOT help. Code archived (`API_INCOMING_CPU`, default OFF).
+### Leaderboard (vivo em rinhadebackend.com.br)
+| # | Participante | Stack | p99 |
+|---|---|---|---|
+| 1 | rafaelcoelhox (rafaelcoelhox-detecta-fraude) | Rust+C LB | **0.362192ms** |
+| 2 | dalvorsn (dalvorsn-cpp) | C++ | 0.365789ms |
+| 3 | vinicius-piassa (rinha-backend-2026-asm) | ASM | 0.377381ms |
+| 4 | fksegundo (fksegundo-rust) | Rust | 0.391305ms |
+| **5** | **epicvinny (nos)** | C reactor+Rust | **0.404048ms** |
 
-## The GCP bench-lab (built this session — reusable, but know its limits)
-- `docs/gcp-bench-lab.md` = full how-to. VM `rinha-haswell` (us-central1-a, n1-standard-8,
-  SPOT, **currently STOPPED**), driven from WSL via `CLOUDSDK_CONFIG=/mnt/c/Users/visuz/AppData/Roaming/gcloud`.
-  Tooling in `bench/` (gen_compose.sh, sweep-runner.sh, run.sh, memdiag.sh); `bench/results/`.
-- **🔴 Lab limits (why it can't pick µs winners):** ~240µs/session baseline DRIFT,
-  ~30µs run noise, AND **NAPI busy-poll does NOT engage on GCP virtio** (`EPIOCSPARAMS`
-  EINVAL). Use GCP only for **correctness + gross regressions**, never busy-poll/RX tuning.
-- **🔴 k6 MUST use `SharedArray`** (a per-VU `open()` of the 27MB dataset OOM'd & wedged
-  the VM — cost hours). Already fixed in `bench/k6-bench.js`.
+O 0.404ms vem do #7566 (single-recv regrediu). O **#7577** (LB 0.20/API 0.40x2) esta PENDENTE na fila (~1h) e e o teste vivo. Resultado do sweep GCP de CPU split tambem pendente (agente background).
 
-## Hard constraints (do not fight)
-`privileged:false`, `CapAdd:null` (no CAP_NET_ADMIN), `seccomp=unconfined` FORBIDDEN,
-compose `cpuset` IGNORED (pin via in-process `API_PIN_CPU`/`LB_PIN_CPU`), docker bridge only,
-**1 CPU / 350 MB total** (lb 0.02/30, api 0.49/160×2), kernel ≥6.9, Haswell ~2.6GHz 4 logical CPUs.
-**DEAD ENDS:** io_uring (seccomp), SO_BUSY_POLL/AF_XDP/DPDK (caps), musl/scratch (cold-start only),
-classifier/parser/SIMD micro-opt (~4µs, non-bottleneck), per-req QUICKACK rearm (regressed #7385),
-SO_INCOMING_CPU (rejected #7553), more total CPU (already at limit).
+### Submission branch atual
+- **Repo registrado:** `epicvinny-sub` = `epicvinny/rinha-de-backend-2026-epicvinny`
+- **Commit:** `4819600` — `epoll-clean-ec97581`, LB **0.20** cpu/30MB, API **0.40x2**/160MB, `API_BUSY_POLL_US=50`, `API_PIN_CPU=0/1`, sem `API_SINGLE_RECV`
+- **Imagem:** `visuzano/rinha-2026:epoll-clean-ec97581` (C reactor, tree_only, busy-poll 50/8/prefer1)
+- **Revert de segurança:** se o #7577 regredir, reverter para `285ee52` (LB 0.02/API 0.49, mesma imagem)
 
-## What's actually left (all low-EV, be honest with the user before spending previews)
-The remaining gains are below the preview noise floor, so each is a **coin-flip preview gamble**:
-1. **C/ASM hot-path rewrite** of the epoll+EPIOCSPARAMS reactor — the only *credible* code
-   path (flat fd state, zero per-req alloc, tighter syscalls). `crates/api/src/epoll_server.rs`
-   is the spec; `crates/scorer/reactor.c` is the current C reactor. But #7393 showed C==Rust,
-   so the upside is doubtful.
-2. Other socket-opt levers (TCP_NOTSENT_LOWAT, SO_RCVLOWAT) — but SO_INCOMING_CPU already
-   showed RX/wakeup socket-opts don't move it.
-**Recommendation:** 0.3647 is at/near the floor; the honest move is likely to STOP tuning and
-bank it, unless the user explicitly wants to spend previews on a sub-noise gamble. Don't
-auto-spend previews — surface the gamble and let the user decide.
+### Branch dev
+- `codex/epoll-frontier` @ `43f9383` (pushed) — tem single-recv archived (default OFF, nao usar)
 
-## Operating rules (unchanged)
-- **Previews: 10/DAY cap** (tracker in `CLAUDE.md`; used 2/10 on 2026-05-31). ALWAYS
-  fresh-pull validate the RELEASE image (`docker compose up` + curl) BEFORE filing.
-  Build SINGLE-ARCH (`docker buildx ... --provenance=false --sbom=false`) or `/opt/*` vanish.
-- Submission procedure (image → fresh-pull validate → submission branch via git plumbing on
-  `epicvinny-sub` → `gh issue create --repo zanfranceschi/... --body "rinha/test epicvinny"`
-  → log it → **revert to 285ee52 on any regression**): full steps in `CLAUDE.md`.
-- Gotchas: `gh issue create` ALWAYS needs `--repo`; use `git -C "D:\Github\..."`; bare Bash
-  = Git Bash, use `wsl -d Ubuntu -e bash -lc '...'` for `/mnt/...`; WSL git can't write
-  `.git/config` (use `GIT_AUTHOR_*` env for commits). Author = `epicvinny <vinicius.suzano@rdstation.com>`.
-- Non-negotiables: 0 5xx, 0 oracle mismatches, vectorizer byte-equal, single-query warm p99.
+---
 
-Final test deadline: **2026-06-05**.
+## DESCOBERTAS CRITICAS desta sessão (2026-05-31)
+
+### 1. O novo #1 subiu com mudanca APENAS no compose (zero codigo)
+`rafaelcoelhox` (0.397ms->0.362ms) mudou so `docker-compose.yml` (commit `16e54a5c`, +11/-5):
+```diff
+- lb cpus: "0.10"   ->  lb cpus: "0.20"    # LB ganhou mais CPU
+- api cpus: "0.45"  ->  api cpus: "0.40"   # APIs cederam CPU ao LB
++ EPOLL_BUSY_POLL_US: "100"                 # busy-poll kernel 50->100us
++ EPOLL_IDLE_US: "60"                       # idle quantum 250->60us
+```
+Imagens dos containers nao foram reconstruidas. Ganho de ~35us so com rebalance de CPU.
+
+### 2. Nossas conclusoes da campanha de CPU eram provavelmente artefatos de variancia
+Todos os "resultados" (0.387->0.377->0.368->0.365) eram cada um **um unico draw** dentro de distribuicao com ~28us de variancia. A progressao pareceu convincente mas era sequencial sem repeticoes. O #1 ganhou usando o sentido oposto (mais LB, menos API). Conclusao: **as conclusoes de env-tuning da campanha de maio nao sao confiaveis como verdades absolutas**.
+
+### 3. single-recv REGREDIU +40us — motivo entendido
+Removemos o drain-until-EAGAIN do `drive()` e regredimos (#7566=0.404ms). Causa: k6 roda **co-localizado** com o server na Rinha. Apos enviar a resposta, o cliente ja enviou o proximo request — o drain `read()` le o **proximo request antecipadamente** (lookahead implicito). Removendo o drain adicionamos uma round-trip extra de epoll_wait. O #1 faz single-recv mas tem busy-poll agressivo (30us spin + 60us `epoll_pwait2`) que torna a round-trip desprezivel. Codigo single-recv fica arquivado em `reactor.c`/`epoll_server.rs` com flag `API_SINGLE_RECV` (default OFF).
+
+### 4. Analise completa do rafaelcoelhox (repo: `rafaelcoelhox/detecta-fraude`)
+- **C fd-lb** (`native/fd-lb.c`): `TCP_DEFER_ACCEPT` no listen; `TCP_NODELAY+TCP_QUICKACK` em cada fd **antes do SCM_RIGHTS** (API nao precisa fazer setsockopt por conexao)
+- **3-tier epoll wait** (`src/server.rs`): (1) `epoll_wait(0)` non-blocking -> (2) 30us `spin_loop` -> (3) `epoll_pwait2(timespec{tv_nsec:60000})` — ns-granularity, muito mais preciso que nosso `epoll_wait(1ms)`
+- **`network_mode: none`** no api2 — zero overhead veth/conntrack/bridge
+- **Scoring**: vector 5-NN sobre 3M vetores i16 AVX2, KD-tree com early-exit. CPU ~0.92us (comparavel com nossa tree de 4us — ambos abaixo do gargalo de wakeup)
+- `logging: driver: none` em todos os servicos
+- JSON parser order-independent (nosso e posicional/dependente de ordem)
+- Imagem separada para LB (`Dockerfile.lb`), static binary em scratch
+
+---
+
+## O que fazer apos acordar (ordem de prioridade)
+
+### 1. Verificar resultado do #7577 (LB 0.20/API 0.40x2)
+```bash
+gh api repos/zanfranceschi/rinha-de-backend-2026/issues/7577/comments --jq '.[0].body' | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['test-results']['scoring']['raw']['p99_ms'])"
+# ou simplesmente:
+gh issue view --repo zanfranceschi/rinha-de-backend-2026 7577 --comments
+```
+- **< 0.362ms** -> somos #1. **PARAR** (nunca re-rolar um resultado vencedor).
+- **< 0.404ms (melhorou)** -> LB 0.20 funciona. Considerar Test 2.
+- **>= 0.404ms (regrediu)** -> reverter submission para `285ee52`:
+  ```bash
+  # git plumbing para reverter (ver procedimento completo abaixo)
+  ```
+
+### 2. Verificar resultado do sweep GCP
+```bash
+wsl -d Ubuntu -e bash -lc 'export CLOUDSDK_CONFIG=/mnt/c/Users/visuz/AppData/Roaming/gcloud && gcloud compute ssh rinha-haswell --zone=us-central1-a --command="cat ~/rinha/sweep-results.tsv" 2>&1'
+```
+Isso revela qual CPU split otimiza relativamente no GCP. PARAR a VM depois:
+```bash
+wsl -d Ubuntu -e bash -lc 'export CLOUDSDK_CONFIG=/mnt/c/Users/visuz/AppData/Roaming/gcloud && gcloud compute instances stop rinha-haswell --zone=us-central1-a 2>&1'
+```
+
+### 3. Se #7577 melhorou — Test 2 (sem rebuild)
+Testar em conjunto (compose-only):
+- `API_BUSY_POLL_US=100` (o #1 usa; nossa campanha rejeitou com um unico draw ruidoso)
+- `network_mode: none` no api2 — mas validar localmente primeiro: o healthcheck curl precisa do loopback (existe em none mode); trocar `condition: service_healthy` por `condition: service_started` no api2 do LB depends_on para evitar deadlock
+- `logging: driver: none` em todos os servicos (pequena reducao de overhead Docker)
+
+### 4. Se ainda nao #1 — codigo (rebuild necessario)
+Gap de codigo real vs o #1:
+1. **3-tier epoll idle em `reactor.c`**: apos EPIOCSPARAMS expirar, fazer 30us `spin_loop` de `epoll_wait(0)` -> depois `epoll_pwait2({.tv_nsec=60000})` em vez de `epoll_wait(1ms)`. Isso reduz latencia de acordar de 1ms para 60us.
+2. **Com idle agressivo, re-testar single-recv** — round-trip de epoll vira 60us (vs 1ms atual); o trade-off muda.
+3. **TCP_NODELAY/QUICKACK no LB pre-handoff** (`fd_handoff_lb.c`), remover do API — ~2 setsockopt por conexao removidos do core de API.
+
+---
+
+## Hard constraints (nao mudar)
+- `privileged:false`, `CapAdd:null`, sem `seccomp=unconfined`
+- Compose `cpuset` IGNORADO no engine oficial — usar `API_PIN_CPU` in-process
+- **1 CPU / 350 MB total** (todas as instancias somadas)
+- Scoring: 0 FP, 0 FN — validar com `cargo run --release --bin check_classifier -- --queries test/test-data.json`
+- Previews: 10/dia (tracker em `CLAUDE.md`; usado 5/10 em 2026-05-31); **NUNCA 2 issues em paralelo**
+
+## Dead ends confirmados
+- io_uring (seccomp bloqueado)
+- SO_INCOMING_CPU (rejeitado #7553, piassa tambem nao usa)
+- SO_BUSY_POLL socket-level (sem CAP_NET_ADMIN)
+- single-recv SEM busy-poll agressivo (regrediu #7566)
+- Otimizar scorer/parser (4us, nao e o gargalo)
+- 3+ instancias de API (dilui quota CFS)
+
+## Procedimento de submissão (quick-ref)
+```bash
+# === BUILD (sem attestation) ===
+docker buildx build --platform linux/amd64 --provenance=false --sbom=false \
+  -t visuzano/rinha-2026:<tag> -t visuzano/rinha-2026:latest --push "D:\Github\rinha-de-backend-2026"
+
+# === VALIDAR LOCAL ===
+docker rmi visuzano/rinha-2026:<tag>
+docker compose -f C:/Users/visuz/rinha-submission/docker-compose.yml pull
+docker compose -f C:/Users/visuz/rinha-submission/docker-compose.yml up -d
+curl -X POST localhost:9999/fraud-score -H "Content-Type: application/json" -d '{...}'
+docker compose -f C:/Users/visuz/rinha-submission/docker-compose.yml down
+
+# === ATUALIZAR SUBMISSION BRANCH (git plumbing) ===
+cd /d/Github/rinha-de-backend-2026
+COMPOSE_SHA=$(git hash-object -w /c/Users/visuz/rinha-submission/docker-compose.yml)
+git cat-file blob "$COMPOSE_SHA" | grep -c $'\r' && echo "CRLF - ABORT" || echo "LF OK"
+INFO_SHA=fc244baf773033946711f9ca70ff4d11fb882862
+NEW_TREE=$(printf "100644 blob %s\tdocker-compose.yml\n100644 blob %s\tinfo.json\n" "$COMPOSE_SHA" "$INFO_SHA" | git mktree)
+git fetch epicvinny-sub submission:refs/remotes/epicvinny-sub/submission 2>/dev/null
+NEW_COMMIT=$(git commit-tree "$NEW_TREE" -p refs/remotes/epicvinny-sub/submission -m "submission: <desc>")
+git update-ref refs/heads/submission "$NEW_COMMIT"
+git push epicvinny-sub submission:submission --force
+
+# === PREVIEW TEST (SEMPRE --repo; NUNCA 2 issues simultaneas) ===
+gh issue create --repo zanfranceschi/rinha-de-backend-2026 --title "Preview test - epicvinny" --body "rinha/test epicvinny"
+# -> registrar no CLAUDE.md tracker
+```
+
+## Revert para banked (285ee52)
+```bash
+cd /d/Github/rinha-de-backend-2026
+# tree do commit banked
+BANKED_TREE=$(git cat-file commit 285ee52927a67351ffc415e024764f462b7a758f | grep "^tree" | awk '{print $2}')
+git fetch epicvinny-sub submission:refs/remotes/epicvinny-sub/submission 2>/dev/null
+NEW_COMMIT=$(git commit-tree "$BANKED_TREE" -p refs/remotes/epicvinny-sub/submission -m "revert: back to banked epoll-clean-ec97581 (LB 0.02/API 0.49)")
+git update-ref refs/heads/submission "$NEW_COMMIT"
+git push epicvinny-sub submission:submission --force
+```
+
+Deadline: **2026-06-05**.
