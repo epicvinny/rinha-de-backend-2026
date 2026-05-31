@@ -35,9 +35,16 @@
 #include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/un.h>
+#include <time.h>
 #include <unistd.h>
+
+/* epoll_pwait2: Linux 5.11+, syscall 441. Works when EPIOCSPARAMS (6.9+) works. */
+#ifndef SYS_epoll_pwait2
+#define SYS_epoll_pwait2 441
+#endif
 
 #ifndef PR_SET_TIMERSLACK
 #define PR_SET_TIMERSLACK 29
@@ -136,6 +143,10 @@ static uint32_t g_busy_poll_us = 50;
 static uint32_t g_busy_poll_budget = 8;
 static uint32_t g_prefer_busy_poll = 1;
 static int g_incoming_cpu = -1;   /* SO_INCOMING_CPU target; -1 = disabled (default) */
+/* 3-tier idle: epoll_wait(0) → spin(g_epoll_spin_us) → epoll_pwait2(g_epoll_idle_us) */
+static uint32_t g_epoll_spin_us = 0;  /* API_EPOLL_SPIN_US: userspace spin µs (0=off) */
+static uint32_t g_epoll_idle_us = 0;  /* API_EPOLL_IDLE_US: pwait2 block µs (0=use 1ms) */
+static int g_pwait2_enosys = 0;       /* set once if epoll_pwait2 returns ENOSYS */
 
 static uint32_t env_u32(const char *key, uint32_t dflt) {
     const char *v = getenv(key);
@@ -763,6 +774,52 @@ static void warm_classifier(uint32_t iters) {
     (void)sink;
 }
 
+/* ---- 3-tier epoll idle strategy ----------------------------------------
+ * Phase 1: epoll_wait(0)  — non-blocking; also triggers NAPI busy-poll.
+ * Phase 2: spin           — repeated epoll_wait(0)+PAUSE for g_epoll_spin_us µs.
+ * Phase 3: epoll_pwait2   — nanosecond-precision block for g_epoll_idle_us µs,
+ *                           fallback to epoll_wait(fallback_ms) on ENOSYS.
+ * When g_epoll_spin_us==0 and g_epoll_idle_us==0, equivalent to the old
+ * epoll_wait(fallback_ms) — zero behaviour change by default. */
+static int epoll_wait_tiered(int epfd, struct epoll_event *evs, int maxev,
+                              int fallback_ms) {
+    int n;
+
+    /* Phase 1: non-blocking poll */
+    n = epoll_wait(epfd, evs, maxev, 0);
+    if (n != 0) return n;
+
+    /* Phase 2: userspace spin */
+    if (g_epoll_spin_us > 0) {
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        long end_ns = (long)t0.tv_sec * 1000000000L + t0.tv_nsec
+                      + (long)g_epoll_spin_us * 1000L;
+        for (;;) {
+            n = epoll_wait(epfd, evs, maxev, 0);
+            if (n != 0) return n;
+            __asm__ volatile("pause" ::: "memory");
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            if ((long)t1.tv_sec * 1000000000L + t1.tv_nsec >= end_ns) break;
+        }
+    }
+
+    /* Phase 3: nanosecond-precision block */
+    if (g_epoll_idle_us > 0 && !g_pwait2_enosys) {
+        struct timespec ts = { .tv_sec = 0,
+                               .tv_nsec = (long)g_epoll_idle_us * 1000L };
+        n = (int)syscall(SYS_epoll_pwait2, epfd, evs, maxev, &ts, NULL,
+                         (size_t)0);
+        if (n < 0 && errno == ENOSYS) {
+            g_pwait2_enosys = 1;  /* kernel too old; fall through */
+        } else {
+            return n;
+        }
+    }
+
+    return epoll_wait(epfd, evs, maxev, fallback_ms);
+}
+
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
 
@@ -776,11 +833,13 @@ int main(void) {
     if (strncmp(path, "unix:", 5) == 0) path += 5;
 
     int port = (int)env_u32("PORT", 8080);
-    g_rearm_quickack = env_u32("API_QUICKACK_REARM", 0) != 0;
-    g_single_recv    = env_u32("API_SINGLE_RECV",    0) != 0;
-    g_busy_poll_us   = env_u32("API_BUSY_POLL_US",   50);
-    g_busy_poll_budget = env_u32("API_BUSY_POLL_BUDGET", 8);
-    g_prefer_busy_poll = env_u32("API_PREFER_BUSY_POLL", 1);
+    g_rearm_quickack   = env_u32("API_QUICKACK_REARM",   0) != 0;
+    g_single_recv      = env_u32("API_SINGLE_RECV",      0) != 0;
+    g_busy_poll_us     = env_u32("API_BUSY_POLL_US",     50);
+    g_busy_poll_budget = env_u32("API_BUSY_POLL_BUDGET",  8);
+    g_prefer_busy_poll = env_u32("API_PREFER_BUSY_POLL",  1);
+    g_epoll_spin_us    = env_u32("API_EPOLL_SPIN_US",     0);
+    g_epoll_idle_us    = env_u32("API_EPOLL_IDLE_US",     0);
     uint32_t warm_iters = env_u32("API_WARM_ITERS", 50000);
 
     /* SO_INCOMING_CPU (default OFF -> banked behavior unchanged). API_INCOMING_CPU=
@@ -821,6 +880,9 @@ int main(void) {
             g_single_recv ? "on (API_SINGLE_RECV=1)" : "off (default)");
     fprintf(stderr, "per-request QUICKACK re-arm: %s\n",
             g_rearm_quickack ? "on" : "off (default)");
+    fprintf(stderr, "3-tier epoll idle: spin=%uus idle=%uus%s\n",
+            g_epoll_spin_us, g_epoll_idle_us,
+            (g_epoll_spin_us == 0 && g_epoll_idle_us == 0) ? " (off, plain epoll_wait)" : "");
 
     /* /ready healthcheck server on a thread */
     pthread_t ready_tid;
@@ -863,7 +925,7 @@ int main(void) {
     struct epoll_event events[MAX_EVENTS];
 
     for (;;) {
-        int n = epoll_wait(epfd, events, MAX_EVENTS, timeout_ms);
+        int n = epoll_wait_tiered(epfd, events, MAX_EVENTS, timeout_ms);
         if (n < 0) {
             if (errno == EINTR) continue;
             perror("epoll_wait");
