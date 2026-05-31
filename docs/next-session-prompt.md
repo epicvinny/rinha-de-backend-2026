@@ -3,64 +3,74 @@
 ---
 
 You are continuing work on **Rinha de Backend 2026** (fraud-detection vector-search;
-scored on single-request **warm p99**, lower is better). The repo is at
-`D:\Github\rinha-de-backend-2026` (public fork). Read `CLAUDE.md` and
-`docs/handoff-roadmap.md` FIRST — they hold the procedure, constraints, dead ends,
-and the test-budget tracker.
+scored on single-request **warm p99**, lower is better). Repo: `D:\Github\rinha-de-backend-2026`
+(public fork). Read `CLAUDE.md`, `docs/handoff-roadmap.md`, and `docs/gcp-bench-lab.md`
+FIRST — procedure, constraints, dead ends, test-budget tracker, and the GCP lab.
 
-## Start from
-- **Local branch `codex/epoll-frontier` @ commit `855f588`** (epoll reactor + QUICKACK
-  re-arm + LB-pin + docs; io_uring code present but SHELVED — do not use it).
-- **Live submission image:** `visuzano/rinha-2026:uring-dfd89b3` (single-arch). On
-  rebuild, retag `epoll-<shortsha>`.
-- **Live submission:** `submission` branch on `epicvinny/rinha-de-backend-2026-epicvinny`
-  @ `9225b7a` (epoll + QUICKACK + LB-pin, no seccomp) = preview test #7385.
+## Start from (state after the 2026-05-31 GCP campaign)
+- **Local branch `codex/epoll-frontier` @ `06df365`** (adds the GCP bench-lab + an
+  env-gated `SO_INCOMING_CPU` lever, **default OFF**; io_uring code present but SHELVED).
+  Not pushed. NOTE: the repo working tree has a pre-existing CRLF↔LF churn — `git status`
+  shows the whole tree "modified"; stage only the specific files you change.
+- **Live submission (registered repo `epicvinny-sub` = epicvinny/rinha-de-backend-2026-epicvinny):**
+  `submission` branch @ **`285ee52`**, image **`visuzano/rinha-2026:epoll-clean-ec97581`**.
+  This is the banked best (C `fd_handoff_lb` + 2× C-reactor APIs, LB 0.02 / API 0.49×2,
+  busy 50/8/prefer1, pins 0/1, `tree_only`). **Do not destabilize it.**
 
-## Where we are
-4th place, **p99 0.387ms**, perfect score (0 FP/FN, 0 5xx). Leaders: #1 asm 0.353,
-#2 cpp 0.357, #3 rust 0.385. Topology: C `fd_handoff_lb` (SCM_RIGHTS) + 2× API epoll
-reactor + EPIOCSPARAMS NAPI busy-poll + `tree_only` classifier. #7385 (QUICKACK+LB-pin)
-result may already be in — check it: `gh issue view 7385 --repo zanfranceschi/rinha-de-backend-2026`.
+## Where we are — read this carefully
+- **Best p99 = 0.3647ms** (preview #7396), perfect score 6000, 0 errors. Sits between
+  #2 (0.357) and #1 (0.353). BUT the same config re-tested at **0.3927ms** (#7555) →
+  **the preview environment has ~28µs run-to-run variance.**
+- **KEY CONCLUSION: the gap to #1 (~12µs) is SMALLER than the measurement noise (~28µs).**
+  It is **not reliably winnable by parameter tuning** — which run you draw matters more
+  than µs-level config changes. 0.3647 is the practical floor.
+- **Env knobs are exhausted.** The banked config is env-optimal and already at the
+  **1 CPU / 350 MB rule limit**. GCP sweep (2026-05-31) confirmed: budget/US/CPU-split all
+  within noise; only US>50 and PREFER=0 were clearly worse (so US≤50 + PREFER=1 are right).
+- **SO_INCOMING_CPU lever: tested and rejected.** Built (`incoming-06df365`), 0 5xx,
+  but #7553 = 0.3854ms (within noise, no gain) → **reverted** to 285ee52. Aligning RX
+  softirq with the reactor core does NOT help. Code archived (`API_INCOMING_CPU`, default OFF).
 
-## Hard constraints (do not fight these)
-- `privileged:false`, `CapAdd:null` (no CAP_NET_ADMIN), **`seccomp=unconfined` FORBIDDEN**,
-  compose `cpuset` IGNORED, docker bridge only, 1.0 CPU / 350MB (lb 0.20/30, api 0.40/160×2),
-  kernel ≥6.9, Haswell 2.6GHz 4 logical CPUs.
-- **DEAD ENDS — do not attempt:** io_uring (needs seccomp), SO_BUSY_POLL/AF_XDP/DPDK
-  (need caps), musl/FROM-scratch for warm p99 (cold-start only), CPU/classifier micro-opts
-  (scoring is ~4µs — measured non-bottleneck), compose cpuset (pin via in-process
-  `sched_setaffinity`: `API_PIN_CPU`, `LB_PIN_CPU`).
+## The GCP bench-lab (built this session — reusable, but know its limits)
+- `docs/gcp-bench-lab.md` = full how-to. VM `rinha-haswell` (us-central1-a, n1-standard-8,
+  SPOT, **currently STOPPED**), driven from WSL via `CLOUDSDK_CONFIG=/mnt/c/Users/visuz/AppData/Roaming/gcloud`.
+  Tooling in `bench/` (gen_compose.sh, sweep-runner.sh, run.sh, memdiag.sh); `bench/results/`.
+- **🔴 Lab limits (why it can't pick µs winners):** ~240µs/session baseline DRIFT,
+  ~30µs run noise, AND **NAPI busy-poll does NOT engage on GCP virtio** (`EPIOCSPARAMS`
+  EINVAL). Use GCP only for **correctness + gross regressions**, never busy-poll/RX tuning.
+- **🔴 k6 MUST use `SharedArray`** (a per-VU `open()` of the 27MB dataset OOM'd & wedged
+  the VM — cost hours). Already fixed in `bench/k6-bench.js`.
 
-## Goal (reframed honestly)
-**0.10ms is almost certainly infeasible** under this sandbox (world-best 0.353ms ASM on
-the same hardware/rules; the floor is docker-bridge RTT + syscall/wakeup, all
-kernel-bypass options blocked). **Target: beat 0.353ms** (frontier ~0.30–0.35).
+## Hard constraints (do not fight)
+`privileged:false`, `CapAdd:null` (no CAP_NET_ADMIN), `seccomp=unconfined` FORBIDDEN,
+compose `cpuset` IGNORED (pin via in-process `API_PIN_CPU`/`LB_PIN_CPU`), docker bridge only,
+**1 CPU / 350 MB total** (lb 0.02/30, api 0.49/160×2), kernel ≥6.9, Haswell ~2.6GHz 4 logical CPUs.
+**DEAD ENDS:** io_uring (seccomp), SO_BUSY_POLL/AF_XDP/DPDK (caps), musl/scratch (cold-start only),
+classifier/parser/SIMD micro-opt (~4µs, non-bottleneck), per-req QUICKACK rearm (regressed #7385),
+SO_INCOMING_CPU (rejected #7553), more total CPU (already at limit).
 
-## Roadmap (priority order — see docs/handoff-roadmap.md for detail)
-1. Confirm #7385's score (QUICKACK+LB-pin should beat 0.387). New baseline.
-2. **Tune busy-poll ON TARGET** (biggest knob, untunable on WSL): sweep
-   `API_BUSY_POLL_US` {25,50,100,200} and `API_BUSY_POLL_BUDGET` {8,16,32,64}.
-3. **Out-ASM the per-request overhead**: rewrite the epoll+EPIOCSPARAMS hot path as
-   C-static or ASM `FROM scratch` (Rust `crates/api/src/epoll_server.rs` is the spec):
-   flat-array fd state (no HashMap), zero per-request alloc, tight syscall sequence,
-   pre-rendered responses (already have). This is the credible ~0.35→~0.32 path.
-4. Micro-loop opts (measure each on target — below WSL noise).
+## What's actually left (all low-EV, be honest with the user before spending previews)
+The remaining gains are below the preview noise floor, so each is a **coin-flip preview gamble**:
+1. **C/ASM hot-path rewrite** of the epoll+EPIOCSPARAMS reactor — the only *credible* code
+   path (flat fd state, zero per-req alloc, tighter syscalls). `crates/api/src/epoll_server.rs`
+   is the spec; `crates/scorer/reactor.c` is the current C reactor. But #7393 showed C==Rust,
+   so the upside is doubtful.
+2. Other socket-opt levers (TCP_NOTSENT_LOWAT, SO_RCVLOWAT) — but SO_INCOMING_CPU already
+   showed RX/wakeup socket-opts don't move it.
+**Recommendation:** 0.3647 is at/near the floor; the honest move is likely to STOP tuning and
+bank it, unless the user explicitly wants to spend previews on a sub-noise gamble. Don't
+auto-spend previews — surface the gamble and let the user decide.
 
-## Operating rules
-- **Preview tests: 10/DAY cap.** Track in `CLAUDE.md`. ALWAYS validate the RELEASE image
-  via fresh-pull `docker compose up` + curl BEFORE filing (a debug build once hid a
-  release crash). Build images SINGLE-ARCH (`docker buildx ... --provenance=false
-  --sbom=false`) or `/opt/*` vanish on pull.
-- **Never push source to a public repo** — only the Docker image + the test-files
-  `submission` branch (compose + info.json, no code) on the registered repo.
-- Submission procedure (image → fresh-pull validate → submission branch via git plumbing
-  → `gh issue create --repo zanfranceschi/... --body "rinha/test epicvinny"` → log it):
-  full steps in `CLAUDE.md`.
-- Gotchas: `gh issue create` ALWAYS needs `--repo` (defaults to upstream on forks);
-  PowerShell CWD persists + `C:\Users\visuz` is a git repo → use `git -C "D:\Github\..."`;
-  bare Bash tool = Git Bash (Windows paths), use `wsl -d Ubuntu -e bash -lc '...'` for
-  `/mnt/...` + cargo/gcc. WSL is kernel 6.6 → no NAPI locally (busy-poll is target-only).
-- Non-negotiables: 0 5xx, 0 oracle mismatches, vectorizer byte-equal builder/api,
-  single-query warm p99, no test-payload lookup.
+## Operating rules (unchanged)
+- **Previews: 10/DAY cap** (tracker in `CLAUDE.md`; used 2/10 on 2026-05-31). ALWAYS
+  fresh-pull validate the RELEASE image (`docker compose up` + curl) BEFORE filing.
+  Build SINGLE-ARCH (`docker buildx ... --provenance=false --sbom=false`) or `/opt/*` vanish.
+- Submission procedure (image → fresh-pull validate → submission branch via git plumbing on
+  `epicvinny-sub` → `gh issue create --repo zanfranceschi/... --body "rinha/test epicvinny"`
+  → log it → **revert to 285ee52 on any regression**): full steps in `CLAUDE.md`.
+- Gotchas: `gh issue create` ALWAYS needs `--repo`; use `git -C "D:\Github\..."`; bare Bash
+  = Git Bash, use `wsl -d Ubuntu -e bash -lc '...'` for `/mnt/...`; WSL git can't write
+  `.git/config` (use `GIT_AUTHOR_*` env for commits). Author = `epicvinny <vinicius.suzano@rdstation.com>`.
+- Non-negotiables: 0 5xx, 0 oracle mismatches, vectorizer byte-equal, single-query warm p99.
 
 Final test deadline: **2026-06-05**.

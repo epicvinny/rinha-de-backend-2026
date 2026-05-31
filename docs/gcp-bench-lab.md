@@ -275,3 +275,31 @@ levers**. Use it to catch gross regressions and confirm directional choices — 
 
 > **Always STOP the VM when not actively benching** (`bash ~/rinha-bench/gcp.sh stop`) — it's
 > SPOT (preempted twice mid-campaign; incremental TSV made resume painless) and bills while up.
+
+---
+
+## 9. Campaign outcome (2026-05-31) — and the preview-variance finding
+
+The one code lever GCP flagged as "null" was preview-tested directly, and a re-confirmation
+of the banked config exposed the real ceiling:
+
+| preview | config | image / commit | p99 | note |
+|---------|--------|----------------|-----|------|
+| #7396 | banked | epoll-clean-ec97581 / 285ee52 | **0.3647** | the recorded best |
+| #7553 | SO_INCOMING_CPU=pin | incoming-06df365 / 274416e | 0.3854 | no gain → **reverted** |
+| #7555 | banked (re-run) | epoll-clean-ec97581 / 285ee52 | **0.3927** | same config as #7396 |
+
+**The headline: the identical banked config measured 0.3647 (#7396) and 0.3927 (#7555) —
+~28 µs of run-to-run variance in the official preview environment.** That noise is *larger*
+than the ~12 µs gap to #1 (0.353). So:
+- The "0.3647" best was the **lucky tail** of a ~0.36–0.39 ms distribution, not deterministic.
+- SO_INCOMING_CPU's 0.3854 was **inside that noise band** — it neither clearly helped nor
+  hurt (reverting was still the right safe call; it showed no gain). Verified the build was
+  correct: `incoming-06df365`'s `/opt/api_c_reactor` contains the `SO_INCOMING_CPU` symbol
+  (1 match) and `epoll-clean-ec97581` does not (0) — distinct digests, so the change *did* deploy.
+- **The p99 tie-break is not reliably winnable by tuning** — which run you draw dominates
+  µs-level config changes. **0.3647 is the practical floor; the campaign is concluded here.**
+
+**Net of the whole campaign:** no config beats the banked 0.3647 — env knobs are exhausted
+(at the 1 CPU/350 MB limit), the SO_INCOMING_CPU code lever was rejected, and the residual gap
+to #1 is below measurement noise. Live submission = banked 285ee52 (correct image, intact).
