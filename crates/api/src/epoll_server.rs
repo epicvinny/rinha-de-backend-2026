@@ -122,6 +122,22 @@ fn set_nonblocking(fd: RawFd) -> io::Result<()> {
     Ok(())
 }
 
+/// SO_INCOMING_CPU target: `API_INCOMING_CPU`="pin" aligns RX steering to this
+/// instance's `API_PIN_CPU`; an integer sets it explicitly. None/unset => disabled
+/// (default; banked behavior unchanged).
+fn incoming_cpu() -> Option<libc::c_int> {
+    let v = std::env::var("API_INCOMING_CPU").ok()?;
+    let v = v.trim();
+    if v.is_empty() {
+        return None;
+    }
+    if v == "pin" {
+        std::env::var("API_PIN_CPU").ok()?.trim().parse::<libc::c_int>().ok()
+    } else {
+        v.parse::<libc::c_int>().ok()
+    }
+}
+
 /// Best-effort client-socket tuning. `TCP_NODELAY`/`TCP_QUICKACK` are the
 /// effective ones under `privileged: false`; `SO_BUSY_POLL` family is attempted
 /// but typically no-ops without `CAP_NET_ADMIN` (the EPIOCSPARAMS path is what
@@ -143,6 +159,12 @@ fn tune_client_fd(fd: RawFd) {
         let budget: libc::c_int = env_u32("API_BUSY_POLL_BUDGET", 8) as libc::c_int;
         let budget_ptr = &budget as *const libc::c_int as *const libc::c_void;
         let _ = libc::setsockopt(fd, libc::SOL_SOCKET, 70, budget_ptr, len);
+        // SO_INCOMING_CPU = 49: steer RX softirq/NAPI to the reactor's pinned core
+        // (cuts cross-CPU wakeup). Default OFF; aligned via API_INCOMING_CPU.
+        if let Some(icpu) = incoming_cpu() {
+            let icpu_ptr = &icpu as *const libc::c_int as *const libc::c_void;
+            let _ = libc::setsockopt(fd, libc::SOL_SOCKET, 49, icpu_ptr, len);
+        }
     }
 }
 

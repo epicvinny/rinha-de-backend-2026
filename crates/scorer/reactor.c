@@ -65,6 +65,11 @@ struct epoll_params {
 #ifndef SO_BUSY_POLL_BUDGET
 #define SO_BUSY_POLL_BUDGET 70
 #endif
+/* SO_INCOMING_CPU: steer this socket's RX to a given CPU so softirq/NAPI lands on
+ * the reactor's pinned core (cuts cross-CPU wakeup). Best-effort; no caps needed. */
+#ifndef SO_INCOMING_CPU
+#define SO_INCOMING_CPU 49
+#endif
 
 /* Exact response byte strings (must match main.rs byte-for-byte). */
 #define R_BAD_REQUEST \
@@ -123,6 +128,7 @@ static int g_rearm_quickack = 0;
 static uint32_t g_busy_poll_us = 50;
 static uint32_t g_busy_poll_budget = 8;
 static uint32_t g_prefer_busy_poll = 1;
+static int g_incoming_cpu = -1;   /* SO_INCOMING_CPU target; -1 = disabled (default) */
 
 static uint32_t env_u32(const char *key, uint32_t dflt) {
     const char *v = getenv(key);
@@ -192,6 +198,10 @@ static void tune_client_fd(int fd) {
     setsockopt(fd, SOL_SOCKET, SO_PREFER_BUSY_POLL, &prefer, sizeof(prefer));
     int budget = (int)g_busy_poll_budget;
     setsockopt(fd, SOL_SOCKET, SO_BUSY_POLL_BUDGET, &budget, sizeof(budget));
+    if (g_incoming_cpu >= 0) {
+        int icpu = g_incoming_cpu;
+        setsockopt(fd, SOL_SOCKET, SO_INCOMING_CPU, &icpu, sizeof(icpu));
+    }
 }
 
 static void set_quickack(int fd) {
@@ -744,6 +754,23 @@ int main(void) {
     g_busy_poll_budget = env_u32("API_BUSY_POLL_BUDGET", 8);
     g_prefer_busy_poll = env_u32("API_PREFER_BUSY_POLL", 1);
     uint32_t warm_iters = env_u32("API_WARM_ITERS", 50000);
+
+    /* SO_INCOMING_CPU (default OFF -> banked behavior unchanged). API_INCOMING_CPU=
+     * "pin" aligns RX steering to this instance's API_PIN_CPU; an integer sets it
+     * explicitly. */
+    {
+        const char *ic = getenv("API_INCOMING_CPU");
+        if (ic && *ic) {
+            if (strcmp(ic, "pin") == 0) {
+                const char *p = getenv("API_PIN_CPU");
+                if (p && *p) g_incoming_cpu = atoi(p);
+            } else {
+                g_incoming_cpu = atoi(ic);
+            }
+        }
+        fprintf(stderr, "SO_INCOMING_CPU: %s (%d)\n",
+                g_incoming_cpu >= 0 ? "on" : "off (default)", g_incoming_cpu);
+    }
 
     maybe_pin_cpu();
     fprintf(stderr, "per-request QUICKACK re-arm: %s\n",

@@ -3,15 +3,22 @@
 // K6_DATA (default ./test-data.json next to this script on the VM).
 //
 // Run (on the VM): K6_DATA=$HOME/rinha/test-data.json k6 run --summary-export=/tmp/k6-summary.json k6-bench.js
+//
+// ⚠️ The dataset is loaded via SharedArray (parsed ONCE, shared read-only across all VUs).
+// Do NOT revert to module-scope `open()+JSON.parse` — test-data.json is ~27 MB, so a per-VU
+// copy at 100-250 VUs balloons to 10-37 GB → OOM → the VM wedges (SSH banner timeout).
 import http from 'k6/http';
 import { check } from 'k6';
+import { SharedArray } from 'k6/data';
 
-const RAW = open(__ENV.K6_DATA || 'test-data.json');
-const parsed = JSON.parse(RAW);
-const ENTRIES = Array.isArray(parsed) ? parsed : (parsed.entries || []);
+const ENTRIES = new SharedArray('entries', function () {
+  const parsed = JSON.parse(open(__ENV.K6_DATA || 'test-data.json'));
+  return Array.isArray(parsed) ? parsed : (parsed.entries || []);
+});
 
 export const options = {
   summaryTrendStats: ['avg', 'p(95)', 'p(99)', 'max'],
+  discardResponseBodies: true,
   scenarios: {
     default: {
       executor: 'ramping-arrival-rate',
